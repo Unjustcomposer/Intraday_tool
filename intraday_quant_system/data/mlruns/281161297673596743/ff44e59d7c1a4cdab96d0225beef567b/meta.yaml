@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/ff44e59d7c1a4cdab96d0225beef567b/artifacts
+end_time: 1779965504713
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: ff44e59d7c1a4cdab96d0225beef567b
+run_name: unruly-mouse-71
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779965452703
+status: 3
+tags: []
+user_id: khand

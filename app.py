@@ -15,6 +15,7 @@ import feedparser
 import re
 import time
 import sys
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -155,21 +156,57 @@ SECTOR_KEYWORDS = {
 }
 
 
-def fetch_news(hours_back=6):
-    """Fetch recent news from multiple RSS feeds."""
+def sanitize_unicode(text: str) -> str:
+    """Sanitize text to prevent UnicodeEncodeError crashes on Windows CP1252 consoles."""
+    if not text:
+        return ""
+    # Remove zero-width spaces
+    text = text.replace('\u200b', '')
+    # Map fancy/high unicode quotes and hyphens to standard equivalents
+    replacements = {
+        '\u2018': "'", '\u2019': "'",
+        '\u201c': '"', '\u201d': '"',
+        '\u2013': '-', '\u2014': '-',
+        '\u2022': '*', '\u2026': '...'
+    }
+    for orig, rep in replacements.items():
+        text = text.replace(orig, rep)
+        
+    try:
+        enc = sys.stdout.encoding or 'cp1252'
+        return text.encode(enc, errors='replace').decode(enc)
+    except Exception:
+        return text.encode('ascii', errors='replace').decode('ascii')
+
+
+async def fetch_feed_async(session, url: str):
+    """Asynchronously fetch RSS feed content."""
+    try:
+        async with session.get(url, timeout=10) as response:
+            content = await response.read()
+            # parse from string/bytes in a non-blocking way
+            return feedparser.parse(content)
+    except Exception:
+        return None
+
+
+async def fetch_news_async(hours_back=6):
+    """Fetch recent news from multiple RSS feeds concurrently using aiohttp."""
+    import aiohttp
     articles = []
     cutoff = datetime.now() - timedelta(hours=hours_back)
 
-    for feed_url in NEWS_FEEDS:
-        try:
-            feed = feedparser.parse(feed_url)
-            if feed.bozo and not feed.entries:
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_feed_async(session, url) for url in NEWS_FEEDS]
+        feeds = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for feed_url, feed in zip(NEWS_FEEDS, feeds):
+            if feed is None or isinstance(feed, Exception) or not hasattr(feed, 'entries'):
                 continue
-
+                
             for entry in feed.entries:
                 headline = entry.get("title", "")
                 body = entry.get("summary", entry.get("description", ""))
-                # Strip HTML tags from body
                 body = re.sub(r"<[^>]+>", "", body)
 
                 pub_time = None
@@ -185,13 +222,11 @@ def fetch_news(hours_back=6):
                     continue
 
                 articles.append({
-                    "headline": headline,
-                    "body": body[:500],
+                    "headline": sanitize_unicode(headline),
+                    "body": sanitize_unicode(body[:500]),
                     "published_at": pub_time,
                     "source": feed_url.split("/")[2],
                 })
-        except Exception:
-            continue
 
     # Deduplicate by headline similarity
     seen = set()
@@ -276,25 +311,27 @@ def detect_specific_stocks(headline, body=""):
 # ============================================================================
 class IntradayAnalyzer:
     """Analyzes a single stock using technical indicators."""
-
     def __init__(self, symbol):
         self.symbol = symbol if symbol.endswith(".NS") else f"{symbol}.NS"
         self.data = None
 
-    def fetch_and_analyze(self, max_retries=2):
+    async def fetch_and_analyze(self, max_retries=2):
         """Fetch data + calculate indicators + generate signal. Returns result dict or None."""
-        data = None
-        for attempt in range(max_retries):
-            try:
-                ticker = yf.Ticker(self.symbol)
-                data = ticker.history(period="5d", interval="5m")
-                if data is not None and not data.empty and len(data) >= 30:
-                    break
-                data = None
-            except Exception:
-                pass
-            if attempt < max_retries - 1:
-                time.sleep(1.5)
+        if self.data is not None and not self.data.empty:
+            data = self.data
+        else:
+            data = None
+            for attempt in range(max_retries):
+                try:
+                    ticker = yf.Ticker(self.symbol)
+                    data = await asyncio.to_thread(ticker.history, period="5d", interval="5m")
+                    if data is not None and not data.empty and len(data) >= 30:
+                        break
+                    data = None
+                except Exception:
+                    pass
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1.5)
 
         if data is None or data.empty or len(data) < 30:
             return None
@@ -460,38 +497,32 @@ class IntradayAnalyzer:
         }
 
 
-def analyze_stock(symbol):
-    """Thread-safe wrapper for analyzing a single stock."""
-    time.sleep(0.5)  # Rate limit to avoid Yahoo Finance blocking
-    analyzer = IntradayAnalyzer(symbol)
-    return analyzer.fetch_and_analyze()
-
-
 # ============================================================================
-#  MAIN ORCHESTRATOR
+#  ASYNC QUEUE PIPELINE WORKERS
 # ============================================================================
-def run_scanner():
-    print("\n" + "=" * 74)
-    print("  NEWS-DRIVEN INTRADAY TRADING SCANNER")
-    print("  Scans live news -> Detects shocks -> Analyzes affected sectors")
-    print("  WARNING: For educational purposes only. Trade at your own risk.")
-    print("=" * 74)
 
-    # STEP 1: Fetch news
+async def news_producer(
+    news_queue: asyncio.Queue,
+    hours_back: int,
+    directly_mentioned_stocks: set,
+    affected_sectors: dict,
+    shock_articles: list
+):
+    """Stage 1: Fetch recent news, extract sentiment, and identify shocks/sectors."""
     print("\n[1/4] Scanning live news feeds...")
-    articles = fetch_news(hours_back=12)
+    articles = await fetch_news_async(hours_back=hours_back)
     print(f"      Found {len(articles)} recent articles from {len(NEWS_FEEDS)} sources")
 
     if not articles:
         print("\n  [!] No recent news articles found. Falling back to full market scan.")
-        articles = [{"headline": "Market overview scan", "body": "", "published_at": datetime.now(), "source": "fallback"}]
+        articles = [{
+            "headline": "Market overview scan",
+            "body": "",
+            "published_at": datetime.now(),
+            "source": "fallback"
+        }]
 
-    # STEP 2: Detect shocks and affected sectors
     print("\n[2/4] Analyzing news for shocks and sector impact...")
-    shock_articles = []
-    affected_sectors = {}
-    directly_mentioned_stocks = set()
-
     for article in articles:
         is_shock, impact, score = detect_shock(article["headline"], article["body"])
         sentiment = analyze_sentiment(article["headline"] + " " + article["body"])
@@ -499,23 +530,134 @@ def run_scanner():
         stocks = detect_specific_stocks(article["headline"], article["body"])
 
         if is_shock or abs(sentiment) >= 0.3:
-            shock_articles.append({
+            item = {
                 **article,
                 "impact": impact,
                 "shock_score": score,
                 "sentiment": sentiment,
                 "sectors": sectors,
                 "stocks": stocks,
-            })
+            }
+            shock_articles.append(item)
             for s in sectors:
                 affected_sectors[s] = affected_sectors.get(s, 0) + score
             for st in stocks:
                 directly_mentioned_stocks.add(st)
+                
+            await news_queue.put(item)
+            
+    # Sentinel
+    await news_queue.put(None)
+
+
+async def market_data_producer(
+    news_queue: asyncio.Queue,
+    market_data_queue: asyncio.Queue,
+    directly_mentioned_stocks: set,
+    affected_sectors: dict
+):
+    """Stage 2: Process shock news, build stock list, download intraday candles asynchronously."""
+    # Retrieve all shock items from news queue
+    news_items = []
+    while True:
+        item = await news_queue.get()
+        if item is None:
+            news_queue.task_done()
+            break
+        news_items.append(item)
+        news_queue.task_done()
+
+    print("\n[3/4] Building scan list from affected sectors...")
+    stocks_to_scan = set()
+    stocks_to_scan.update(directly_mentioned_stocks)
 
     # Sort sectors by total shock score
     sorted_sectors = sorted(affected_sectors.items(), key=lambda x: x[1], reverse=True)
+    if sorted_sectors:
+        for sector, score in sorted_sectors[:4]:
+            sector_stocks = SECTOR_STOCKS.get(sector, [])
+            stocks_to_scan.update(sector_stocks)
+            print(f"      + {sector} sector ({len(sector_stocks)} stocks, shock score: {score})")
+    else:
+        print("      No sector-specific shocks. Scanning top stocks from all sectors...")
+        for sector, stocks in SECTOR_STOCKS.items():
+            stocks_to_scan.update(stocks[:3])
 
-    # Print shock news
+    print(f"\n      Total stocks to analyze: {len(stocks_to_scan)}")
+    print("\n[4/4] Ingesting market data and running technical analysis...")
+
+    # Fetch data concurrently using a semaphore to avoid rate limit bans
+    sem = asyncio.Semaphore(5)
+    
+    async def process_single_stock(symbol):
+        async with sem:
+            await asyncio.sleep(0.5)  # Rate limiting throttle
+            analyzer = IntradayAnalyzer(symbol)
+            result = await analyzer.fetch_and_analyze()
+            if result:
+                # Boost if mentioned directly in news
+                result["news_boost"] = result["symbol"].upper() in directly_mentioned_stocks
+                await market_data_queue.put(result)
+
+    tasks = [asyncio.create_task(process_single_stock(s)) for s in stocks_to_scan]
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    # Sentinel to signal completion
+    await market_data_queue.put(None)
+
+
+async def analysis_consumer(market_data_queue: asyncio.Queue, results: list):
+    """Stage 3: Consumer that collects and tracks signals generated."""
+    done_count = 0
+    while True:
+        result = await market_data_queue.get()
+        if result is None:
+            market_data_queue.task_done()
+            break
+        results.append(result)
+        done_count += 1
+        sys.stdout.write(f"\r      Analyzed {done_count} setups...")
+        sys.stdout.flush()
+        market_data_queue.task_done()
+
+
+# ============================================================================
+#  MAIN ORCHESTRATOR
+# ============================================================================
+async def run_scanner():
+    print("\n" + "=" * 74)
+    print("  NEWS-DRIVEN INTRADAY TRADING SCANNER (ASYNCHRONOUS)")
+    print("  Scans live news -> Detects shocks -> Analyzes affected sectors")
+    print("  WARNING: For educational purposes only. Trade at your own risk.")
+    print("=" * 74)
+
+    # Initialize Queues
+    news_queue = asyncio.Queue()
+    market_data_queue = asyncio.Queue()
+
+    shock_articles = []
+    affected_sectors = {}
+    directly_mentioned_stocks = set()
+    results = []
+
+    # Run producers and consumer concurrently
+    prod_task = asyncio.create_task(news_producer(
+        news_queue, 12, directly_mentioned_stocks, affected_sectors, shock_articles
+    ))
+    
+    data_task = asyncio.create_task(market_data_producer(
+        news_queue, market_data_queue, directly_mentioned_stocks, affected_sectors
+    ))
+    
+    cons_task = asyncio.create_task(analysis_consumer(
+        market_data_queue, results
+    ))
+
+    await asyncio.gather(prod_task, data_task, cons_task)
+    print(f"\n      Completed: {len(results)} stocks successfully analyzed.")
+
+    # Sort and print shocks
     if shock_articles:
         print(f"\n      Detected {len(shock_articles)} market-moving news items:\n")
         for i, sa in enumerate(shock_articles[:10], 1):
@@ -526,60 +668,12 @@ def run_scanner():
             if sa["stocks"]:
                 print(f"         Stocks:  {', '.join(sa['stocks'])}")
     else:
-        print("      No major shocks detected. Running broad market scan instead.")
-
-    # STEP 3: Build the scan list
-    print("\n[3/4] Building scan list from affected sectors...")
-    stocks_to_scan = set()
-
-    # Add directly mentioned stocks first
-    stocks_to_scan.update(directly_mentioned_stocks)
-
-    if sorted_sectors:
-        # Add all stocks from the top affected sectors
-        for sector, score in sorted_sectors[:4]:
-            sector_stocks = SECTOR_STOCKS.get(sector, [])
-            stocks_to_scan.update(sector_stocks)
-            print(f"      + {sector} sector ({len(sector_stocks)} stocks, shock score: {score})")
-    else:
-        # Fallback: scan the most liquid stocks from each sector
-        print("      No sector-specific shocks. Scanning top stocks from all sectors...")
-        for sector, stocks in SECTOR_STOCKS.items():
-            stocks_to_scan.update(stocks[:3])
-
-    print(f"\n      Total stocks to analyze: {len(stocks_to_scan)}")
-
-    # STEP 4: Run technical analysis in parallel
-    print("\n[4/4] Running technical analysis (this may take a minute)...")
-    results = []
-    failed = 0
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {executor.submit(analyze_stock, s): s for s in stocks_to_scan}
-        done_count = 0
-        total = len(futures)
-        for future in as_completed(futures):
-            done_count += 1
-            sys.stdout.write(f"\r      Analyzed {done_count}/{total} stocks...")
-            sys.stdout.flush()
-            result = future.result()
-            if result:
-                # Boost score for directly mentioned stocks
-                if result["symbol"].upper() in directly_mentioned_stocks:
-                    result["news_boost"] = True
-                else:
-                    result["news_boost"] = False
-                results.append(result)
-            else:
-                failed += 1
-
-    print(f"\n      Completed: {len(results)} analyzed, {failed} failed/no data")
+        print("      No major shocks detected.")
 
     # ========================================================================
     #  RESULTS — Ranked by PROFIT potential
     # ========================================================================
     actionable = [r for r in results if r["signal"] != "HOLD"]
-    # Filter: only show trades with meaningful profit (> 0.3%)
     high_profit = [r for r in actionable if r["profit_pct_t1"] >= 0.3]
     high_profit.sort(key=lambda x: x["profit_pct_t2"], reverse=True)
 
@@ -589,8 +683,12 @@ def run_scanner():
     def print_trade_card(r, rank):
         news_tag = " << NEWS DRIVEN >>" if r.get("news_boost") else ""
         action = "BUY AT" if "BUY" in r["signal"] else "SELL AT"
+        symbol = sanitize_unicode(r['symbol'])
+        sector = sanitize_unicode(r['sector'])
+        signal = sanitize_unicode(r['signal'])
+        
         print(f"\n  {'='*68}")
-        print(f"  #{rank}  {r['symbol']} | {r['sector']} | {r['signal']}{news_tag}")
+        print(f"  #{rank}  {symbol} | {sector} | {signal}{news_tag}")
         print(f"  {'='*68}")
         print(f"  |  CMP (Current Price)  :  INR {r['price']}")
         print(f"  |  {action:<22}:  INR {r['entry']}")
@@ -607,7 +705,7 @@ def run_scanner():
         print(f"  |")
         print(f"  |  RSI: {r['rsi']}  |  ATR: {r['atr']}  |  Volume: {r['vol_ratio']}x avg")
         for reason in r["reasons"]:
-            print(f"  |    {reason}")
+            print(f"  |    {sanitize_unicode(reason)}")
         print(f"  {'='*68}")
 
     print("\n\n" + "#" * 74)
@@ -637,7 +735,9 @@ def run_scanner():
     print("  " + "-" * 71)
     for i, r in enumerate(high_profit[:20], 1):
         tag = "*" if r.get("news_boost") else " "
-        print(f" {tag}{i:<3} {r['symbol']:<12} {r['signal']:<11} {r['entry']:>8} {r['stop_loss']:>8} {r['target1']:>8} {r['target2']:>8} {r['profit_pct_t2']:>7}%")
+        symbol = sanitize_unicode(r['symbol'])
+        signal = sanitize_unicode(r['signal'])
+        print(f" {tag}{i:<3} {symbol:<12} {signal:<11} {r['entry']:>8} {r['stop_loss']:>8} {r['target1']:>8} {r['target2']:>8} {r['profit_pct_t2']:>7}%")
 
     if not high_profit:
         print("  No actionable trades.")
@@ -647,12 +747,221 @@ def run_scanner():
     if watching:
         print(f"\n  WATCHLIST (news-mentioned, waiting for entry):")
         for r in watching:
-            print(f"    {r['symbol']:<12} {r['sector']:<10} CMP: INR {r['price']:>8}  RSI:{r['rsi']}  Support: {r['support']}")
+            symbol = sanitize_unicode(r['symbol'])
+            sector = sanitize_unicode(r['sector'])
+            print(f"    {symbol:<12} {sector:<10} CMP: INR {r['price']:>8}  RSI:{r['rsi']}  Support: {r['support']}")
 
     print("\n" + "=" * 74)
     print(f"  Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}")
     print("=" * 74 + "\n")
 
 
+# ============================================================================
+#  LIVE WEBSOCKET SCANNER (SIMULATED EVENT-DRIVEN FEED)
+# ============================================================================
+
+class LiveWebsocketScanner:
+    """
+    Simulates a live WebSocket feed, aggregates ticks into OHLCV bars,
+    and feeds closed bars directly to the IntradayAnalyzer.
+    """
+    def __init__(self, symbols, interval_mins=1):
+        self.symbols = [s if s.endswith(".NS") else f"{s}.NS" for s in symbols]
+        self.interval_mins = interval_mins
+        self.data_cache = {}  # {symbol: pd.DataFrame}
+        self.active_bars = {}  # {symbol: active_bar_dict}
+        self.running = False
+
+    async def bootstrap(self):
+        """Bootstraps the analyzer with historical candles so technical indicators can be calculated immediately."""
+        print(f"\n[Bootstrap] Downloading historical {self.interval_mins}m bars to warm up indicators...")
+        sem = asyncio.Semaphore(5)
+        
+        async def fetch_one(symbol):
+            async with sem:
+                try:
+                    ticker = yf.Ticker(symbol)
+                    # Use ThreadPoolExecutor to run the blocking yfinance call
+                    df = await asyncio.to_thread(ticker.history, period="5d", interval=f"{self.interval_mins}m")
+                    if df is not None and not df.empty and len(df) >= 30:
+                        df.index.name = "Datetime"
+                        self.data_cache[symbol] = df.tail(60)
+                        print(f"      [OK] {symbol} warmed up with {len(self.data_cache[symbol])} bars.")
+                    else:
+                        print(f"      [FAIL] {symbol} insufficient history ({len(df) if df is not None else 0} bars).")
+                except Exception as e:
+                    print(f"      [FAIL] {symbol} error during warmup: {e}")
+                    
+        tasks = [fetch_one(s) for s in self.symbols]
+        await asyncio.gather(*tasks)
+
+    async def tick_producer(self, tick_queue: asyncio.Queue):
+        """Generates continuous mock ticks simulating a live WebSocket stream."""
+        import random
+        prices = {}
+        for symbol in self.symbols:
+            if symbol in self.data_cache and not self.data_cache[symbol].empty:
+                prices[symbol] = float(self.data_cache[symbol]['Close'].iloc[-1])
+            else:
+                prices[symbol] = 1500.0
+                
+        print("\n[WebSocket] Simulated feed connected. Producing ticks...")
+        while self.running:
+            # Generate ticks for 1-3 random symbols every 200ms
+            active_subset = random.sample(self.symbols, k=random.randint(1, min(3, len(self.symbols))))
+            for symbol in active_subset:
+                # Random walk with slight drift
+                prices[symbol] += random.uniform(-0.4, 0.4)
+                tick = {
+                    'symbol': symbol,
+                    'price': round(prices[symbol], 2),
+                    'volume': random.randint(5, 50),
+                    'timestamp': datetime.now()
+                }
+                await tick_queue.put(tick)
+            await asyncio.sleep(0.2)
+
+async def run_live_websocket_scanner(universe, interval_mins=1, duration_sec=0):
+    """
+    Runs the live event-driven scanner using simulated websocket tick queues.
+    """
+    print("\n" + "=" * 74)
+    print(f"  LIVE WEBSOCKET INTRADAY SCANNER (SIMULATED FEED)")
+    print(f"  Aggregating ticks into {interval_mins}-minute bars")
+    print(f"  Universe: {', '.join(universe)}")
+    print("=" * 74)
+
+    scanner = LiveWebsocketScanner(universe, interval_mins=interval_mins)
+    await scanner.bootstrap()
+    
+    tick_queue = asyncio.Queue()
+    scanner.running = True
+    
+    producer_task = asyncio.create_task(scanner.tick_producer(tick_queue))
+    start_time = time.time()
+    
+    print("\n[Live Scanner] Active. Monitoring bars. Press Ctrl+C to stop.")
+    
+    try:
+        while scanner.running:
+            if duration_sec > 0 and (time.time() - start_time) > duration_sec:
+                print(f"\n[Live Scanner] Target duration of {duration_sec}s reached. Stopping scanner...")
+                break
+                
+            try:
+                tick = await asyncio.wait_for(tick_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+                
+            symbol = tick['symbol']
+            price = tick['price']
+            volume = tick['volume']
+            ts = tick['timestamp']
+            
+            # Align tick timestamp to the bar boundary
+            bar_ts = ts.replace(second=0, microsecond=0)
+            bar_ts = bar_ts - timedelta(minutes=bar_ts.minute % scanner.interval_mins)
+            
+            if symbol not in scanner.active_bars:
+                scanner.active_bars[symbol] = {
+                    'timestamp': bar_ts,
+                    'Open': price,
+                    'High': price,
+                    'Low': price,
+                    'Close': price,
+                    'Volume': volume
+                }
+                tick_queue.task_done()
+                continue
+                
+            active = scanner.active_bars[symbol]
+            
+            # If the tick time is greater than the active bar boundary, finalize it!
+            if bar_ts > active['timestamp']:
+                finalized = active
+                ts_str = finalized['timestamp'].strftime('%H:%M:%S')
+                clean_symbol = sanitize_unicode(symbol.replace(".NS", ""))
+                msg = f"\n[BAR CLOSED] {clean_symbol} at {ts_str} | OHLCV: {finalized['Open']:.2f}/{finalized['High']:.2f}/{finalized['Low']:.2f}/{finalized['Close']:.2f} | Vol: {finalized['Volume']}"
+                print(msg)
+                
+                # Update the history cache
+                if symbol in scanner.data_cache:
+                    df = scanner.data_cache[symbol]
+                    new_row = pd.DataFrame([{
+                        'Open': finalized['Open'],
+                        'High': finalized['High'],
+                        'Low': finalized['Low'],
+                        'Close': finalized['Close'],
+                        'Volume': finalized['Volume']
+                    }], index=[finalized['timestamp']])
+                    new_row.index.name = "Datetime"
+                    
+                    df = pd.concat([df, new_row])
+                    if len(df) > 100:
+                        df = df.iloc[-100:]
+                    scanner.data_cache[symbol] = df
+                    
+                    # Run analysis on the updated data (with REST call bypassed since analyzer.data is populated)
+                    analyzer = IntradayAnalyzer(symbol)
+                    analyzer.data = df
+                    result = await analyzer.fetch_and_analyze()
+                    if result and result['signal'] != "HOLD":
+                        reasons_str = " | ".join(result['reasons'][:2])
+                        alert_msg = f"  >>> SIGNAL ALERT: {result['signal']} for {result['symbol']} at CMP INR {result['price']}! SL: {result['stop_loss']} | T1: {result['target1']} ({reasons_str})"
+                        print(sanitize_unicode(alert_msg))
+                
+                # Start the next bar
+                scanner.active_bars[symbol] = {
+                    'timestamp': bar_ts,
+                    'Open': price,
+                    'High': price,
+                    'Low': price,
+                    'Close': price,
+                    'Volume': volume
+                }
+            else:
+                # Update high/low/close/volume
+                active['High'] = max(active['High'], price)
+                active['Low'] = min(active['Low'], price)
+                active['Close'] = price
+                active['Volume'] += volume
+                
+            tick_queue.task_done()
+            
+    except asyncio.CancelledError:
+        pass
+    except KeyboardInterrupt:
+        print("\n[Live Scanner] Interrupted by user. Exiting...")
+    finally:
+        scanner.running = False
+        producer_task.cancel()
+        print("\n[Live Scanner] Shutdown complete.")
+
+
 if __name__ == "__main__":
-    run_scanner()
+    import argparse
+    parser = argparse.ArgumentParser(description="News-Driven Intraday Trading Scanner")
+    parser.add_argument("--mode", type=str, default="scan", choices=["scan", "live"],
+                        help="Execution mode: 'scan' (default, fetches recent RSS news and prints trade recommendations) or 'live' (runs simulated live websocket scanner)")
+    parser.add_argument("--universe", type=str, default=None,
+                        help="Comma-separated list of symbols to scan in live mode")
+    parser.add_argument("--interval", type=int, default=1,
+                        help="Bar aggregation interval in minutes for live mode (default: 1)")
+    parser.add_argument("--duration", type=int, default=0,
+                        help="Duration to run the live scanner in seconds (0 = run indefinitely)")
+    args = parser.parse_args()
+    
+    if args.mode == "live":
+        if args.universe:
+            universe = [s.strip() for s in args.universe.split(",")]
+        else:
+            try:
+                from deployment.config import get_config
+                cfg = get_config("config.yaml")
+                universe = cfg.universe
+            except Exception:
+                universe = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "TATAMOTORS", "WIPRO"]
+        
+        asyncio.run(run_live_websocket_scanner(universe, interval_mins=args.interval, duration_sec=args.duration))
+    else:
+        asyncio.run(run_scanner())

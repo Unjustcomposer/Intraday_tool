@@ -23,7 +23,7 @@ def volatility_filter(signal: str, vix: float, threshold: float = 25.0) -> str:
         return 'hold'
     return signal
 
-def confidence_filter(signal: str, meta_confidence: float, threshold: float = 0.6) -> str:
+def confidence_filter(signal: str, meta_confidence: float, threshold: float = 0.5) -> str:
     """Only take trade if meta-labeler confidence is high enough"""
     if meta_confidence < threshold:
         return 'hold'

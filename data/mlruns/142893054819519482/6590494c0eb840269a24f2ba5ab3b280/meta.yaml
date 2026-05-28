@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/data/mlruns/142893054819519482/6590494c0eb840269a24f2ba5ab3b280/artifacts
+end_time: 1779964105126
+entry_point_name: ''
+experiment_id: '142893054819519482'
+lifecycle_stage: active
+run_id: 6590494c0eb840269a24f2ba5ab3b280
+run_name: flawless-cat-90
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779964055829
+status: 3
+tags: []
+user_id: khand

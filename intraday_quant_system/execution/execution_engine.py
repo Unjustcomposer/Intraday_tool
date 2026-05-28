@@ -5,6 +5,8 @@ import pandas as pd
 from typing import Dict, Any, List
 import uuid
 from datetime import datetime
+import tenacity
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,17 @@ class ExecutionEngine:
       - Robust slippage model
       - Position state tracking
     """
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        reraise=True,
+        before_sleep=lambda retry_state: logger.warning(
+            f"Broker API call failed. Retrying... Attempt {retry_state.attempt_number}"
+        )
+    )
+    def _execute_with_retry(self, func, *args, **kwargs):
+        """Execute a broker API call with exponential backoff retry"""
+        return func(*args, **kwargs)
     def __init__(self, api_key: str = "", api_secret: str = "", paper_trading: bool = True):
         self.api_key = api_key
         self.api_secret = api_secret

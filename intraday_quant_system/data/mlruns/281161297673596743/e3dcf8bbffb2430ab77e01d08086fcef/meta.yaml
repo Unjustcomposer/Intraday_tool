@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/e3dcf8bbffb2430ab77e01d08086fcef/artifacts
+end_time: 1779965875478
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: e3dcf8bbffb2430ab77e01d08086fcef
+run_name: useful-donkey-213
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779965827702
+status: 3
+tags: []
+user_id: khand

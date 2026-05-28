@@ -1,0 +1,25 @@
+# Environment secrets
+.env
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data & cache directories
+data/cache/
+data/feature_store/
+*.parquet
+*.pkl
+*.log
+backtest_out.txt
+catboost_info/
+intraday_quant_system/catboost_info/
+__pycache__/
+*.pyc
+.env

@@ -97,7 +97,10 @@ class PostTradeAnalyzer:
             return
         df = pd.DataFrame(self.trades)
         try:
-            df.to_csv(filepath, index=False)
+            if filepath.endswith('.parquet'):
+                df.to_parquet(filepath, index=False)
+            else:
+                df.to_csv(filepath, index=False)
             logger.info(f"Saved post-trade performance reports to {filepath}")
         except Exception as e:
             logger.error(f"Failed to save post-trade report: {e}")

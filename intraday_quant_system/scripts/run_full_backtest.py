@@ -80,7 +80,7 @@ def compute_features_and_labels(symbol: str, df: pd.DataFrame, feature_store: Fe
         features_df['atr'] = compute_atr(features_df)
     
     # Generate labels using triple-barrier method
-    labels = LGBMAlphaModel.make_labels(features_df, atr_mult_up=2.0, atr_mult_down=1.0, horizon_minutes=45)
+    labels = LGBMAlphaModel.make_labels(features_df, atr_mult_up=1.5, atr_mult_down=1.5, horizon_minutes=45)
     features_df['label'] = labels
     
     # Drop rows with NaN features (warmup period)
@@ -124,6 +124,20 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
         
         xgb_model = XGBoostAlphaModel()
         xgb_model.train(X_train, y_train, val_size=0.15)
+        
+        # Save feature importances to local data/ directory for logging as artifacts
+        try:
+            lgbm_imp = lgbm_model.feature_importance()
+            if not lgbm_imp.empty:
+                os.makedirs("./data", exist_ok=True)
+                lgbm_imp.to_csv(f"./data/feature_importance_{symbol}_lgbm.csv", index=False)
+            
+            xgb_imp = xgb_model.get_feature_importance()
+            if not xgb_imp.empty:
+                os.makedirs("./data", exist_ok=True)
+                xgb_imp.to_csv(f"./data/feature_importance_{symbol}_xgboost.csv", index=False)
+        except Exception as e:
+            logger.warning(f"Could not save feature importance: {e}")
         
         # TFT Model
         tft_model = TemporalFusionTransformerModel()
@@ -172,14 +186,43 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
         lgbm_preds = (lgbm_probs > 0.5).astype(int)
         meta_probs = meta_labeler.predict_proba(X_val, primary_preds=lgbm_preds)
         
-        # Simulate trades bar-by-bar
+        # Simulate trades bar-by-bar (with 1-bar execution delay to eliminate zero-latency assumption)
         trades = []
         position = 0
         entry_price = 0.0
         entry_bar = 0
         closes = val_df['close'].values if 'close' in val_df.columns else np.zeros(len(val_df))
+        opens = val_df['open'].values if 'open' in val_df.columns else np.zeros(len(val_df))
+        
+        pending_signal = None  # 'buy' or 'sell' generated on previous bar to execute on current open
+        pending_exit = False   # Exit flag generated on previous bar to execute on current open
         
         for i in range(len(X_val)):
+            current_open = opens[i]
+            current_close = closes[i]
+            if current_open <= 0 or current_close <= 0:
+                continue
+                
+            # 1. Execute pending orders at the OPEN of the candle
+            if pending_exit and position != 0:
+                trade_return = position * (current_open - entry_price) / entry_price
+                trade_return -= round_trip_cost
+                trades.append({
+                    'return': trade_return,
+                    'side': 'long' if position == 1 else 'short',
+                    'duration_bars': i - entry_bar
+                })
+                position = 0
+                entry_price = 0.0
+                pending_exit = False
+                
+            if pending_signal in ('buy', 'sell') and position == 0:
+                position = 1 if pending_signal == 'buy' else -1
+                entry_price = current_open
+                entry_bar = i
+                pending_signal = None
+                
+            # 2. Compute signal at the CLOSE of the candle
             regime = regime_series.iloc[i] if i < len(regime_series) else 'unknown'
             
             score = ensemble.compute_score(
@@ -192,40 +235,34 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
             )
             signal = ensemble.get_signal(score, regime=regime)
             
-            current_price = closes[i]
-            if current_price <= 0:
-                continue
-            
-            # Flat → entry
-            if position == 0 and signal in ('buy', 'sell'):
-                position = 1 if signal == 'buy' else -1
-                entry_price = current_price
-                entry_bar = i
-            
-            # Position → exit (reversal or opposing signal)
-            elif position != 0:
+            # Check exit/entry conditions for the next bar's open
+            if position != 0:
                 exit_now = False
-                
-                # Exit if opposite signal
+                # Exit if opposing signal
                 if (position == 1 and signal == 'sell') or (position == -1 and signal == 'buy'):
                     exit_now = True
-                
+                    pending_signal = signal  # Queue the reverse entry
                 # Exit if held too long (max 45 bars = 3.75 hours)
-                if i - entry_bar >= 45:
+                elif i - entry_bar >= 45:
                     exit_now = True
                 
+                # EOD Exit (15:10 or later)
+                current_time = val_df.index[i]
+                if hasattr(current_time, 'hour') and current_time.hour == 15 and current_time.minute >= 10:
+                    exit_now = True
+                    pending_signal = None
+                    
                 if exit_now:
-                    trade_return = position * (current_price - entry_price) / entry_price
-                    trade_return -= round_trip_cost  # Deduct transaction costs
-                    trades.append({
-                        'return': trade_return,
-                        'side': 'long' if position == 1 else 'short',
-                        'duration_bars': i - entry_bar
-                    })
-                    position = 0
-                    entry_price = 0.0
+                    pending_exit = True
+            else:
+                current_time = val_df.index[i]
+                if hasattr(current_time, 'hour') and current_time.hour == 15 and current_time.minute >= 10:
+                    signal = 'no_trade'
+                    
+                if signal in ('buy', 'sell'):
+                    pending_signal = signal
         
-        # Close any open position at end of validation
+        # Close any open position at end of validation (at the last close price)
         if position != 0 and len(closes) > 0:
             trade_return = position * (closes[-1] - entry_price) / entry_price
             trade_return -= round_trip_cost
@@ -425,6 +462,11 @@ def main():
     
     config = get_config()
     
+    # Initialize MLflow tracking
+    import mlflow
+    mlflow.set_tracking_uri("file:./data/mlruns")
+    mlflow.set_experiment("Intraday_Ensemble_Backtest")
+    
     logger.info("=" * 70)
     logger.info("  FULL END-TO-END BACKTEST (v2 — Full Pipeline)")
     logger.info(f"  Symbols: {args.symbols}")
@@ -432,127 +474,167 @@ def main():
     logger.info(f"  Embargo: 10 bars | Purge: 10 bars")
     logger.info("=" * 70)
     
-    # 1. Fetch data
-    all_data = fetch_data(args.symbols, args.days)
-    if not all_data:
-        logger.error("No data fetched. Aborting.")
-        return
-    
-    # 2. Compute features + labels for each symbol
-    feature_store = FeatureStore(bars_per_day=config.intraday.bars_per_day)
-    all_features = {}
-    
-    for symbol, df in all_data.items():
-        logger.info(f"\nComputing features for {symbol}...")
-        features_df = compute_features_and_labels(symbol, df, feature_store)
-        all_features[symbol] = features_df
-        logger.info(f"  {symbol}: {len(features_df)} samples, "
-                    f"label_rate={features_df['label'].mean():.3f}")
-    
-    # 3. Walk-forward validation per symbol
-    feature_cols = feature_store.get_feature_columns()
-    feature_cols = [c for c in feature_cols if c != 'label']
-    
-    all_wf_results = {}
-    all_trade_returns = []
-    
-    for symbol, features_df in all_features.items():
-        available_cols = [c for c in feature_cols if c in features_df.columns]
-        if len(available_cols) < 3:
-            logger.warning(f"Insufficient features for {symbol}. Skipping.")
-            continue
+    with mlflow.start_run() as run:
+        # Log parameters
+        mlflow.log_params({
+            'symbols': ",".join(args.symbols),
+            'days': args.days,
+            'lgbm_num_leaves': getattr(config.models.lgbm, 'num_leaves', 63),
+            'catboost_iterations': getattr(config.models.catboost, 'iterations', 800),
+            'catboost_depth': getattr(config.models.catboost, 'depth', 5),
+            'catboost_l2_leaf_reg': getattr(config.models.catboost, 'l2_leaf_reg', 10.0),
+        })
         
+        # 1. Fetch data
+        all_data = fetch_data(args.symbols, args.days)
+        if not all_data:
+            logger.error("No data fetched. Aborting.")
+            return
+        
+        # 2. Compute features + labels for each symbol
+        feature_store = FeatureStore(bars_per_day=config.intraday.bars_per_day)
+        all_features = {}
+        
+        for symbol, df in all_data.items():
+            logger.info(f"\nComputing features for {symbol}...")
+            features_df = compute_features_and_labels(symbol, df, feature_store)
+            all_features[symbol] = features_df
+            logger.info(f"  {symbol}: {len(features_df)} samples, "
+                        f"label_rate={features_df['label'].mean():.3f}")
+        
+        # 3. Walk-forward validation per symbol
+        feature_cols = feature_store.get_feature_columns()
+        feature_cols = [c for c in feature_cols if c != 'label']
+        
+        all_wf_results = {}
+        all_trade_returns = []
+        
+        for symbol, features_df in all_features.items():
+            available_cols = [c for c in feature_cols if c in features_df.columns]
+            if len(available_cols) < 3:
+                logger.warning(f"Insufficient features for {symbol}. Skipping.")
+                continue
+            
+            logger.info(f"\n{'='*50}")
+            logger.info(f"Walk-Forward Validation: {symbol}")
+            logger.info(f"  Features: {len(available_cols)}")
+            logger.info(f"  Samples: {len(features_df)}")
+            logger.info(f"{'='*50}")
+            
+            wf_result = run_walk_forward(
+                symbol, features_df, available_cols,
+                {'models': {'lgbm': {'num_leaves': 63}}}
+            )
+            all_wf_results[symbol] = wf_result
+            
+            # Per-split summary — collect individual trade returns for Monte Carlo
+            for sr in wf_result.get('individual_results', []):
+                if 'trade_returns' in sr:
+                    all_trade_returns.extend(sr['trade_returns'])  # Individual trade P&Ls
+                elif 'net_return' in sr:
+                    all_trade_returns.append(sr['net_return'])  # Fallback
+                logger.info(f"  Split {sr.get('split_id','?')}: "
+                           f"Sharpe={sr.get('sharpe',0):.2f} "
+                           f"WR={sr.get('win_rate',0):.1%} "
+                           f"PF={sr.get('profit_factor',0):.2f} "
+                           f"Trades={sr.get('trade_count',0)} "
+                           f"(L={sr.get('long_count',0)} S={sr.get('short_count',0)}) "
+                           f"AUC={sr.get('val_auc',0.5):.3f}")
+            
+            # Log symbol metrics to MLflow
+            agg = wf_result.get('aggregated', {})
+            for key, val in agg.items():
+                if isinstance(val, (int, float, np.number)):
+                    mlflow.log_metric(f"{symbol}_{key}", float(val))
+                    
+            # Log feature importances as artifacts if saved
+            lgbm_imp_file = f"./data/feature_importance_{symbol}_lgbm.csv"
+            xgb_imp_file = f"./data/feature_importance_{symbol}_xgboost.csv"
+            if os.path.exists(lgbm_imp_file):
+                mlflow.log_artifact(lgbm_imp_file)
+            if os.path.exists(xgb_imp_file):
+                mlflow.log_artifact(xgb_imp_file)
+        
+        # 4. Monte Carlo stress test
         logger.info(f"\n{'='*50}")
-        logger.info(f"Walk-Forward Validation: {symbol}")
-        logger.info(f"  Features: {len(available_cols)}")
-        logger.info(f"  Samples: {len(features_df)}")
+        logger.info("Monte Carlo Stress Test (5,000 simulations)")
         logger.info(f"{'='*50}")
         
-        wf_result = run_walk_forward(
-            symbol, features_df, available_cols,
-            {'models': {'lgbm': {'num_leaves': 63}}}
-        )
-        all_wf_results[symbol] = wf_result
+        mc_results = {}
+        if all_trade_returns:
+            mc_results = run_monte_carlo(np.array(all_trade_returns), config.max_capital)
         
-        # Per-split summary — collect individual trade returns for Monte Carlo
-        for sr in wf_result.get('individual_results', []):
-            if 'trade_returns' in sr:
-                all_trade_returns.extend(sr['trade_returns'])  # Individual trade P&Ls
-            elif 'net_return' in sr:
-                all_trade_returns.append(sr['net_return'])  # Fallback
-            logger.info(f"  Split {sr.get('split_id','?')}: "
-                       f"Sharpe={sr.get('sharpe',0):.2f} "
-                       f"WR={sr.get('win_rate',0):.1%} "
-                       f"PF={sr.get('profit_factor',0):.2f} "
-                       f"Trades={sr.get('trade_count',0)} "
-                       f"(L={sr.get('long_count',0)} S={sr.get('short_count',0)}) "
-                       f"AUC={sr.get('val_auc',0.5):.3f}")
-    
-    # 4. Monte Carlo stress test
-    logger.info(f"\n{'='*50}")
-    logger.info("Monte Carlo Stress Test (5,000 simulations)")
-    logger.info(f"{'='*50}")
-    
-    mc_results = {}
-    if all_trade_returns:
-        mc_results = run_monte_carlo(np.array(all_trade_returns), config.max_capital)
-    
-    # 5. Generate report
-    combined_agg = {}
-    for symbol, wf in all_wf_results.items():
-        for key, val in wf.get('aggregated', {}).items():
-            if key not in combined_agg:
-                combined_agg[key] = []
-            combined_agg[key].append(val)
-    
-    avg_agg = {}
-    for k, v in combined_agg.items():
-        try:
-            # Check if elements are numeric
-            if len(v) > 0 and isinstance(v[0], (int, float, np.number)):
-                avg_agg[k] = np.mean(v)
-            else:
-                avg_agg[k] = v[0] if len(v) > 0 else None
-        except Exception:
-            pass
-    report = generate_report(
-        {'aggregated': avg_agg},
-        mc_results,
-        config
-    )
-    
-    # Print report
-    logger.info(f"\n{'#'*70}")
-    logger.info("  BACKTEST REPORT")
-    logger.info(f"{'#'*70}")
-    
-    logger.info(f"\n  VERDICT: {report['go_no_go']}")
-    logger.info(f"  {report['recommendation']}\n")
-    
-    for check_name, check_data in report['checks'].items():
-        status = "✅ PASS" if check_data['pass'] else "❌ FAIL"
-        logger.info(f"  {status} {check_name}: {check_data['value']:.4f} "
-                    f"(threshold: {check_data['threshold']:.4f})")
-    
-    if mc_results:
-        logger.info(f"\n  Monte Carlo ({mc_results.get('n_trades_simulated',0)} trades × 5000 sims):")
-        logger.info(f"    Median terminal capital: ₹{mc_results.get('median_terminal_capital', 0):,.0f}")
-        logger.info(f"    5th percentile (worst):   ₹{mc_results.get('worst_5pct_capital', 0):,.0f}")
-        logger.info(f"    Probability of profit:    {mc_results.get('probability_of_profit', 0):.1%}")
-        logger.info(f"    Prob of ruin (50% DD):     {mc_results.get('probability_of_ruin_50pct', 0):.1%}")
-        logger.info(f"    Median max drawdown:       {mc_results.get('median_max_drawdown', 0):.1%}")
-    
-    # Cross-symbol summary
-    if all_wf_results:
-        logger.info(f"\n  Per-Symbol Summary:")
-        for sym, wf in all_wf_results.items():
-            agg = wf.get('aggregated', {})
-            logger.info(f"    {sym}: Sharpe={agg.get('avg_sharpe',0):.2f} | "
-                       f"WR={agg.get('avg_win_rate',0):.1%} | "
-                       f"PF={agg.get('avg_profit_factor',0):.2f} | "
-                       f"Splits={wf.get('n_splits',0)}")
-    
-    logger.info(f"\n{'#'*70}\n")
+        # 5. Generate report
+        combined_agg = {}
+        for symbol, wf in all_wf_results.items():
+            for key, val in wf.get('aggregated', {}).items():
+                if key not in combined_agg:
+                    combined_agg[key] = []
+                combined_agg[key].append(val)
+        
+        avg_agg = {}
+        for k, v in combined_agg.items():
+            try:
+                if len(v) > 0 and isinstance(v[0], (int, float, np.number)):
+                    avg_agg[k] = np.mean(v)
+                else:
+                    avg_agg[k] = v[0] if len(v) > 0 else None
+            except Exception:
+                pass
+                
+        report = generate_report(
+            {'aggregated': avg_agg},
+            mc_results,
+            config
+        )
+        
+        # Log report metrics to MLflow
+        mlflow.log_param("verdict", report['go_no_go'])
+        for check_name, check_data in report['checks'].items():
+            mlflow.log_metric(f"check_{check_name}_value", float(check_data['value']))
+            mlflow.log_param(f"check_{check_name}_pass", int(check_data['pass']))
+            
+        if mc_results:
+            mlflow.log_metrics({
+                'mc_median_terminal_capital': float(mc_results.get('median_terminal_capital', 0)),
+                'mc_worst_5pct_capital': float(mc_results.get('worst_5pct_capital', 0)),
+                'mc_probability_of_profit': float(mc_results.get('probability_of_profit', 0)),
+                'mc_probability_of_ruin_50pct': float(mc_results.get('probability_of_ruin_50pct', 0)),
+                'mc_median_max_drawdown': float(mc_results.get('median_max_drawdown', 0)),
+            })
+            
+        # Print report
+        logger.info(f"\n{'#'*70}")
+        logger.info("  BACKTEST REPORT")
+        logger.info(f"{'#'*70}")
+        
+        logger.info(f"\n  VERDICT: {report['go_no_go']}")
+        logger.info(f"  {report['recommendation']}\n")
+        
+        for check_name, check_data in report['checks'].items():
+            status = "✅ PASS" if check_data['pass'] else "❌ FAIL"
+            logger.info(f"  {status} {check_name}: {check_data['value']:.4f} "
+                        f"(threshold: {check_data['threshold']:.4f})")
+        
+        if mc_results:
+            logger.info(f"\n  Monte Carlo ({mc_results.get('n_trades_simulated',0)} trades × 5000 sims):")
+            logger.info(f"    Median terminal capital: ₹{mc_results.get('median_terminal_capital', 0):,.0f}")
+            logger.info(f"    5th percentile (worst):   ₹{mc_results.get('worst_5pct_capital', 0):,.0f}")
+            logger.info(f"    Probability of profit:    {mc_results.get('probability_of_profit', 0):.1%}")
+            logger.info(f"    Prob of ruin (50% DD):     {mc_results.get('probability_of_ruin_50pct', 0):.1%}")
+            logger.info(f"    Median max drawdown:       {mc_results.get('median_max_drawdown', 0):.1%}")
+        
+        # Cross-symbol summary
+        if all_wf_results:
+            logger.info(f"\n  Per-Symbol Summary:")
+            for sym, wf in all_wf_results.items():
+                agg = wf.get('aggregated', {})
+                logger.info(f"    {sym}: Sharpe={agg.get('avg_sharpe',0):.2f} | "
+                           f"WR={agg.get('avg_win_rate',0):.1%} | "
+                           f"PF={agg.get('avg_profit_factor',0):.2f} | "
+                           f"Splits={wf.get('n_splits',0)}")
+        
+        logger.info(f"\n{'#'*70}\n")
 
 
 if __name__ == "__main__":

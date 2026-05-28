@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/29b1e79c0d534153a642638b6728c703/artifacts
+end_time: 1779964530040
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 29b1e79c0d534153a642638b6728c703
+run_name: thoughtful-shark-870
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779964438678
+status: 3
+tags: []
+user_id: khand

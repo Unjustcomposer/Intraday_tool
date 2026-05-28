@@ -1,7 +1,8 @@
 import os
 from typing import List, Dict, Any
-from dataclasses import dataclass, field
+from pydantic import BaseModel, Field
 import yaml
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -9,8 +10,7 @@ except ImportError:
     pass  # python-dotenv not installed; env vars must be set externally
 
 
-@dataclass
-class TransactionCosts:
+class TransactionCosts(BaseModel):
     """Indian market transaction cost model (NSE equity intraday)"""
     brokerage_pct: float = 0.0003
     stt_sell_pct: float = 0.00025
@@ -18,7 +18,7 @@ class TransactionCosts:
     gst_pct: float = 0.18
     sebi_turnover_pct: float = 0.000001
     stamp_duty_buy_pct: float = 0.00003
-    estimated_slippage_pct: float = 0.001
+    estimated_slippage_pct: float = 0.0002
     
     def total_cost_buy(self, turnover: float) -> float:
         """Total cost for a buy trade"""
@@ -53,8 +53,7 @@ class TransactionCosts:
         )
 
 
-@dataclass
-class SuccessMetrics:
+class SuccessMetrics(BaseModel):
     """Minimum thresholds for production go-live"""
     min_sharpe_ratio: float = 1.0
     max_drawdown_pct: float = 0.10
@@ -63,8 +62,7 @@ class SuccessMetrics:
     min_walk_forward_splits_passing: float = 0.70
 
 
-@dataclass
-class RiskConfig:
+class RiskConfig(BaseModel):
     """Risk management parameters"""
     max_risk_per_trade: float = 0.02
     max_open_positions: int = 5
@@ -77,8 +75,7 @@ class RiskConfig:
     vix_cutoff: float = 25.0
 
 
-@dataclass
-class IntradayTiming:
+class IntradayTiming(BaseModel):
     """Intraday session parameters for NSE"""
     bars_per_day: int = 75
     bars_per_year: int = 18900
@@ -87,8 +84,7 @@ class IntradayTiming:
     hard_exit: str = "15:15"
 
 
-@dataclass
-class LGBMConfig:
+class LGBMConfig(BaseModel):
     num_leaves: int = 63
     learning_rate: float = 0.03
     n_estimators: int = 2000
@@ -98,16 +94,15 @@ class LGBMConfig:
     min_child_samples: int = 100
 
 
-@dataclass
-class CatBoostConfig:
+class CatBoostConfig(BaseModel):
     iterations: int = 800
     learning_rate: float = 0.05
-    depth: int = 6
+    depth: int = 5
     early_stopping_rounds: int = 50
+    l2_leaf_reg: float = 10.0
 
 
-@dataclass
-class TransformerConfig:
+class TransformerConfig(BaseModel):
     embed_dim: int = 64
     nhead: int = 4
     num_layers: int = 3
@@ -116,20 +111,18 @@ class TransformerConfig:
     patience: int = 10
 
 
-@dataclass
-class ModelsConfig:
-    lgbm: LGBMConfig = field(default_factory=LGBMConfig)
-    catboost: CatBoostConfig = field(default_factory=CatBoostConfig)
-    transformer: TransformerConfig = field(default_factory=TransformerConfig)
+class ModelsConfig(BaseModel):
+    lgbm: LGBMConfig = Field(default_factory=LGBMConfig)
+    catboost: CatBoostConfig = Field(default_factory=CatBoostConfig)
+    transformer: TransformerConfig = Field(default_factory=TransformerConfig)
 
 
-@dataclass
-class QuantConfig:
-    zerodha_api_key: str = field(default_factory=lambda: os.getenv("KITE_API_KEY", ""))
-    zerodha_api_secret: str = field(default_factory=lambda: os.getenv("KITE_API_SECRET", ""))
-    timescaledb_url: str = field(default_factory=lambda: os.getenv("TIMESCALEDB_URL", ""))
-    redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-    universe: List[str] = field(default_factory=list)
+class QuantConfig(BaseModel):
+    zerodha_api_key: str = Field(default_factory=lambda: os.getenv("KITE_API_KEY", ""))
+    zerodha_api_secret: str = Field(default_factory=lambda: os.getenv("KITE_API_SECRET", ""))
+    timescaledb_url: str = Field(default_factory=lambda: os.getenv("TIMESCALEDB_URL", ""))
+    redis_url: str = Field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    universe: List[str] = Field(default_factory=list)
     target_volatility: float = 0.15
     max_capital: float = 1000000.0
     trading_start: str = "09:15"
@@ -137,11 +130,11 @@ class QuantConfig:
     retraining_frequency: str = "weekly"
     
     # Sub-configs
-    transaction_costs: TransactionCosts = field(default_factory=TransactionCosts)
-    success_metrics: SuccessMetrics = field(default_factory=SuccessMetrics)
-    risk: RiskConfig = field(default_factory=RiskConfig)
-    intraday: IntradayTiming = field(default_factory=IntradayTiming)
-    models: ModelsConfig = field(default_factory=ModelsConfig)
+    transaction_costs: TransactionCosts = Field(default_factory=TransactionCosts)
+    success_metrics: SuccessMetrics = Field(default_factory=SuccessMetrics)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    intraday: IntradayTiming = Field(default_factory=IntradayTiming)
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
 
     @classmethod
     def load_from_yaml(cls, yaml_path: str) -> "QuantConfig":
@@ -150,7 +143,7 @@ class QuantConfig:
             raise FileNotFoundError(f"Config file not found at {yaml_path}")
             
         with open(yaml_path, 'r') as f:
-            yaml_data = yaml.safe_load(f)
+            yaml_data = yaml.safe_load(f) or {}
             
         config_dict = {}
         

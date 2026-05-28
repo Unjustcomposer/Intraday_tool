@@ -1,0 +1,8 @@
+artifact_location: file:C:/Users/khand/Desktop/tool/intraday/data/mlruns/142893054819519482
+creation_time: 1779963937418
+experiment_id: '142893054819519482'
+last_update_time: 1779963937418
+lifecycle_stage: active
+name: Intraday_Ensemble_Backtest
+trace_location: null
+workspace: default

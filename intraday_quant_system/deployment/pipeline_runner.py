@@ -503,7 +503,7 @@ class PipelineRunner:
             ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
             if ist_now.weekday() == 4:
                 logger.info("Friday detected. Scheduling weekend retrain.")
-                # self.trigger_retraining()
+                self.trigger_retraining()
         except Exception as e:
             logger.error(f"Error in EOD routine: {e}")
 

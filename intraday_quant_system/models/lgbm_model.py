@@ -6,7 +6,6 @@ import pickle
 import json
 import os
 from datetime import datetime
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, classification_report, brier_score_loss
 
 logger = logging.getLogger(__name__)

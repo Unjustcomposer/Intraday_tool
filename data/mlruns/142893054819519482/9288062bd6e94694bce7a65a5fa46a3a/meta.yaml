@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/data/mlruns/142893054819519482/9288062bd6e94694bce7a65a5fa46a3a/artifacts
+end_time: 1779963940903
+entry_point_name: ''
+experiment_id: '142893054819519482'
+lifecycle_stage: active
+run_id: 9288062bd6e94694bce7a65a5fa46a3a
+run_name: nosy-duck-952
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779963937903
+status: 3
+tags: []
+user_id: khand

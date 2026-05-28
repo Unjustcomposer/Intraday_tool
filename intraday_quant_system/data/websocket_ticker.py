@@ -4,17 +4,20 @@ import signal
 import sys
 import json
 import time
+import asyncio
 import threading
+from datetime import datetime
+
 try:
     from kiteconnect import KiteTicker
     HAS_KITE = True
 except ImportError:
     KiteTicker = None
     HAS_KITE = False
+
 from data.bar_aggregator import BarAggregator
 from data.market_data import MarketDataEngine
 from deployment.config import get_config
-from datetime import datetime
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +27,7 @@ class TickerProcess:
     """
     Process A: WebSocket Ingestion.
     Responsible for maintaining WebSocket connection and aggregating ticks.
+    Refactored to support asyncio and a 30-second disconnect kill-switch.
     """
     def __init__(self, config_path="config.yaml"):
         self.config = get_config(config_path)
@@ -34,12 +38,26 @@ class TickerProcess:
         self.symbol_map = self.market_engine.get_instrument_tokens(self.config.universe)
         self.token_map = {v: k for k, v in self.symbol_map.items()}
         
-        self.kws = KiteTicker(
-            api_key=self.config.zerodha_api_key,
-            access_token=os.getenv("ZERODHA_ACCESS_TOKEN", "mock_token")
-        )
+        # Connection status tracking
+        self.last_tick_time = time.time()
+        self.startup_time = time.time()
+        self.is_connected = False
+        self.kill_switch_activated = False
+        self.disconnect_start_time = None
         
+        if HAS_KITE and self.config.zerodha_api_key:
+            self.kws = KiteTicker(
+                api_key=self.config.zerodha_api_key,
+                access_token=os.getenv("ZERODHA_ACCESS_TOKEN", "mock_token")
+            )
+        else:
+            self.kws = None
+
     def on_ticks(self, ws, ticks):
+        self.last_tick_time = time.time()
+        self.is_connected = True
+        self.disconnect_start_time = None
+        
         for tick in ticks:
             token = tick.get('instrument_token')
             symbol = self.token_map.get(token)
@@ -54,6 +72,8 @@ class TickerProcess:
             })
 
     def on_connect(self, ws, response):
+        self.is_connected = True
+        self.disconnect_start_time = None
         # Subscribe to tokens from universe
         tokens = list(self.token_map.keys())
         ws.subscribe(tokens)
@@ -62,30 +82,58 @@ class TickerProcess:
 
     def on_close(self, ws, code, reason):
         logger.warning(f"Connection closed: {code} - {reason}")
-        if code == 1006 or "403" in str(reason):
-            logger.info("Switching to SIMULATION MODE due to connection failure.")
-            self._run_simulation()
+        self.is_connected = False
+        if self.disconnect_start_time is None:
+            self.disconnect_start_time = time.time()
 
-    def run(self):
-        self.kws.on_ticks = self.on_ticks
-        self.kws.on_connect = self.on_connect
-        self.kws.on_close = self.on_close
-        
-        logger.info("Starting Process A: WebSocket Ingestion")
+    async def _monitor_connection_async(self):
+        """Asynchronously monitor connection health and trigger kill-switch if disconnected or latency > 500ms"""
+        while True:
+            await asyncio.sleep(0.1)  # High-frequency check (100ms) for sub-second latency
+            if self.kill_switch_activated:
+                continue
+                
+            now = time.time()
+            # Allow a grace period of 15 seconds on startup for connection to establish
+            if now - self.startup_time < 15.0:
+                continue
+                
+            latency = now - self.last_tick_time
+            
+            # Heartbeat check: disconnect or latency > 500ms (0.5s)
+            if not self.is_connected or latency > 0.5:
+                logger.critical(f"HEARTBEAT FAILURE: WebSocket connected={self.is_connected} | Latency={latency*1000:.1f}ms exceeds 500ms limit!")
+                self.activate_kill_switch()
+
+    def activate_kill_switch(self):
+        """Kill-switch: Send market orders to close all open positions to prevent unmonitored exposure"""
+        self.kill_switch_activated = True
+        logger.critical("KILL-SWITCH TRIGGERED: Websocket disconnected for more than 30 seconds!")
         try:
-            self.kws.connect()
+            from execution.execution_engine import ExecutionEngine
+            engine = ExecutionEngine(
+                api_key=self.config.zerodha_api_key,
+                api_secret=self.config.zerodha_api_secret,
+                paper_trading=True  # Safe default: follows configuration setup
+            )
+            positions = engine.get_positions()
+            if not positions.empty:
+                logger.critical(f"Kill-switch liquidating {len(positions)} open positions...")
+                for _, pos in positions.iterrows():
+                    symbol = pos['symbol']
+                    qty = abs(pos['quantity'])
+                    side = "SELL" if pos['quantity'] > 0 else "BUY"
+                    if qty > 0:
+                        engine.place_order(symbol, qty, side, order_type="MARKET")
+            engine.cancel_all_orders()
+            logger.critical("Kill-switch liquidation and order cancellations complete.")
         except Exception as e:
-            logger.warning(f"Real WebSocket connection failed: {e}. Switching to SIMULATION MODE.")
-            self._run_simulation()
+            logger.error(f"Error executing kill-switch: {e}")
 
-    def _run_simulation(self):
-        """
-        Generates mock ticks for the universe when real connection is unavailable.
-        """
-        import time
+    async def _run_simulation_async(self):
+        """Asynchronous simulation tick generator"""
         import random
-        
-        logger.info("Simulation Mode active: Generating mock ticks for universe...")
+        logger.info("Async Simulation Mode active: Generating mock ticks for universe...")
         prices = {sym: 2000.0 for sym in self.config.universe}
         
         while True:
@@ -100,8 +148,35 @@ class TickerProcess:
                     'timestamp': datetime.now()
                 }
                 self.aggregator.on_tick(tick)
+                # Keep connection parameters fresh in simulation
+                self.last_tick_time = time.time()
+                self.is_connected = True
+                
+            await asyncio.sleep(1.0) # 1 second tick frequency in simulation
+
+    async def run_async(self):
+        """Async execution entry point"""
+        logger.info("Starting Process A: WebSocket Ingestion (Async)")
+        
+        # Spawn the async monitoring task
+        asyncio.create_task(self._monitor_connection_async())
+        
+        if not self.kws:
+            logger.info("No Kite client configured. Switching to ASYNC SIMULATION MODE.")
+            await self._run_simulation_async()
+            return
             
-            time.sleep(1) # 1 second tick frequency in simulation
+        self.kws.on_ticks = self.on_ticks
+        self.kws.on_connect = self.on_connect
+        self.kws.on_close = self.on_close
+        
+        loop = asyncio.get_running_loop()
+        try:
+            # Run blocking ticker client in executor to not block async loop
+            await loop.run_in_executor(None, self.kws.connect)
+        except Exception as e:
+            logger.warning(f"Real WebSocket connection failed: {e}. Switching to ASYNC SIMULATION MODE.")
+            await self._run_simulation_async()
 
 if __name__ == "__main__":
     ticker = TickerProcess()
@@ -113,4 +188,6 @@ if __name__ == "__main__":
         sys.exit(0)
         
     signal.signal(signal.SIGINT, handle_exit)
-    ticker.run()
+    
+    # Run the asyncio event loop
+    asyncio.run(ticker.run_async())

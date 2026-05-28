@@ -73,8 +73,9 @@ models:
   catboost:
     iterations: 800
     learning_rate: 0.05
-    depth: 6
+    depth: 5
     early_stopping_rounds: 50
+    l2_leaf_reg: 10.0
   transformer:
     embed_dim: 64
     nhead: 4

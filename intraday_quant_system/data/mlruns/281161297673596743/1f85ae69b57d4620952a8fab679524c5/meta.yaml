@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/1f85ae69b57d4620952a8fab679524c5/artifacts
+end_time: 1779965735478
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 1f85ae69b57d4620952a8fab679524c5
+run_name: salty-perch-286
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779965685840
+status: 3
+tags: []
+user_id: khand

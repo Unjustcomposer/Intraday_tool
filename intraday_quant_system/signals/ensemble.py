@@ -64,9 +64,9 @@ class EnsembleScorer:
         }
         
         # Thresholds — calibrate via walk-forward, never on in-sample data
-        self.long_threshold = 0.70    # Lowered from 0.82 (was too restrictive)
-        self.short_threshold = 0.30   # Raised from 0.18 (symmetric from center)
-        self.meta_gate = 0.65
+        self.long_threshold = 0.55    # Lowered to increase trade volume
+        self.short_threshold = 0.45   # Raised to increase trade volume
+        self.meta_gate = 0.50
         
         # Verify all regime weights sum to 1.0
         for regime, w_dict in self.regime_weights.items():
