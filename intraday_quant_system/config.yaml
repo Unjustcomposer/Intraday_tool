@@ -1,0 +1,84 @@
+zerodha:
+  api_key: "${KITE_API_KEY}"
+  api_secret: "${KITE_API_SECRET}"
+
+database:
+  timescaledb_url: "${TIMESCALEDB_URL}"
+  redis_url: "${REDIS_URL}"
+
+trading:
+  universe: 
+    - "RELIANCE"
+    - "TCS"
+    - "HDFCBANK"
+    - "INFY"
+    - "ICICIBANK"
+    - "SBIN"
+    - "TATAMOTORS"
+    - "WIPRO"
+  target_volatility: 0.15
+  max_capital: 1000000.0
+  trading_start: "09:15"
+  trading_end: "15:15"
+  retraining_frequency: "weekly"
+
+# Success metrics — minimum thresholds for production go-live
+success_metrics:
+  min_sharpe_ratio: 1.0
+  max_drawdown_pct: 0.10
+  min_win_rate: 0.50
+  min_profit_factor: 1.3
+  min_walk_forward_splits_passing: 0.70  # 70% of WF splits must be positive
+
+# Indian market transaction costs (NSE equity intraday)
+transaction_costs:
+  brokerage_pct: 0.0003        # 0.03% or ₹20 flat (Zerodha)
+  stt_sell_pct: 0.00025        # 0.025% on sell side (intraday)
+  exchange_txn_pct: 0.0000345  # NSE transaction charge
+  gst_pct: 0.18               # 18% GST on brokerage + exchange charges
+  sebi_turnover_pct: 0.000001  # SEBI turnover fee
+  stamp_duty_buy_pct: 0.00003  # 0.003% on buy side
+  estimated_slippage_pct: 0.001  # 0.1% baseline slippage
+
+# Risk parameters
+risk:
+  max_risk_per_trade: 0.02     # 2% of capital
+  max_open_positions: 5
+  max_sector_exposure: 0.25    # 25%
+  max_portfolio_exposure: 0.70 # 70%
+  min_cash_reserve: 0.30       # 30%
+  daily_loss_limit: 0.03       # 3% — triggers kill switch
+  weekly_loss_limit: 0.06      # 6% — reduces size 50%
+  max_drawdown_limit: 0.10     # 10% — pause for review
+  vix_cutoff: 25               # VIX > 25 — cut exposure
+
+# Intraday timing
+intraday:
+  bars_per_day: 75             # 9:15 to 15:30, 5-min bars
+  bars_per_year: 18900         # 75 bars * 252 trading days
+  no_new_trades_after: "14:30" # No new entries after 2:30 PM
+  begin_closing: "15:10"       # Start closing positions
+  hard_exit: "15:15"           # Force close everything
+
+# Model parameters
+models:
+  lgbm:
+    num_leaves: 63             # Reduced from 127 to limit overfitting
+    learning_rate: 0.03
+    n_estimators: 2000         # Higher but with early stopping
+    early_stopping_rounds: 50
+    feature_fraction: 0.7
+    bagging_fraction: 0.8
+    min_child_samples: 100
+  catboost:
+    iterations: 800
+    learning_rate: 0.05
+    depth: 6
+    early_stopping_rounds: 50
+  transformer:
+    embed_dim: 64
+    nhead: 4
+    num_layers: 3
+    seq_len: 120
+    epochs: 100
+    patience: 10

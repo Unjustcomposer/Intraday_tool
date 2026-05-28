@@ -1,0 +1,9 @@
+__pycache__
+.git
+.env
+*.pyc
+data/cache/*
+data/feature_store/*
+*.parquet
+.venv
+node_modules

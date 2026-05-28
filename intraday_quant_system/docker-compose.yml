@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  pipeline:
+    build: .
+    container_name: quant_pipeline
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - TIMESCALEDB_URL=postgresql://quant:password@timescaledb:5432/intraday_db
+    ports:
+      - "8000:8000" # Prometheus metrics
+      - "8501:8501" # Streamlit Dashboard
+    volumes:
+      - ./data:/app/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: quant_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: quant_timescaledb
+    restart: always
+    environment:
+      - POSTGRES_DB=intraday_db
+      - POSTGRES_USER=quant
+      - POSTGRES_PASSWORD=password
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quant -d intraday_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: quant_prometheus
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - pipeline
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: quant_grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  timescaledb_data:
+  prometheus_data:
+  grafana_data:
