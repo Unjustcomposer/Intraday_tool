@@ -146,27 +146,38 @@ class PortfolioRiskMonitor:
         """
         Calculate 5-minute Parametric VaR based on the EWMA covariance matrix.
         positions_dict: dict mapping symbol -> current absolute exposure in currency (INR)
+        
+        Uses portfolio weights (fractions of total exposure) with return-space covariance
+        to produce dimensionally correct VaR in INR.
         """
         if not positions_dict or not self.ewma_cov:
             self.latest_intraday_var = 0.0
             return 0.0
             
         symbols = list(positions_dict.keys())
+        total_exposure = sum(abs(v) for v in positions_dict.values())
+        
+        if total_exposure == 0:
+            self.latest_intraday_var = 0.0
+            return 0.0
+        
+        # Compute portfolio variance using weights (dimensionally correct)
+        # VaR = z * sqrt(w' * Σ * w) * total_portfolio_value
         portfolio_variance = 0.0
         
         for i in range(len(symbols)):
             sym_a = symbols[i]
-            exp_a = positions_dict[sym_a]
+            w_a = positions_dict[sym_a] / total_exposure  # Weight (fraction)
             
             for j in range(len(symbols)):
                 sym_b = symbols[j]
-                exp_b = positions_dict[sym_b]
+                w_b = positions_dict[sym_b] / total_exposure  # Weight (fraction)
                 
                 key = (sym_a, sym_b) if sym_a <= sym_b else (sym_b, sym_a)
                 cov = self.ewma_cov.get(key, 0.0001 if sym_a == sym_b else 0.0)
                 
-                # portfolio variance = sum_i sum_j exp_i * exp_j * cov_{i,j}
-                portfolio_variance += exp_a * exp_b * cov
+                # Portfolio variance in return space: w' * Σ * w
+                portfolio_variance += w_a * w_b * cov
                 
         if portfolio_variance <= 0:
             self.latest_intraday_var = 0.0
@@ -174,9 +185,16 @@ class PortfolioRiskMonitor:
             
         portfolio_std_dev = np.sqrt(portfolio_variance)
         
-        # Z-score for 95% standard normal is 1.645
-        z_score = 1.645 if confidence_level == 0.95 else 2.326 # 99%
+        # Z-score from inverse normal CDF for any confidence level
+        try:
+            from scipy.stats import norm
+            z_score = norm.ppf(confidence_level)
+        except ImportError:
+            # Fallback: common z-scores
+            z_lookup = {0.90: 1.282, 0.95: 1.645, 0.975: 1.960, 0.99: 2.326}
+            z_score = z_lookup.get(confidence_level, 1.645)
         
-        self.latest_intraday_var = z_score * portfolio_std_dev
+        # VaR in INR = z * portfolio_std (in return space) * total exposure (in INR)
+        self.latest_intraday_var = z_score * portfolio_std_dev * total_exposure
         return self.latest_intraday_var
 

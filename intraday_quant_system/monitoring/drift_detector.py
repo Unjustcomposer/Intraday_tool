@@ -76,8 +76,11 @@ class FeatureDriftMonitor:
                 live_std = X_live[col].std()
                 
                 # 1. Compute Z-score of the shift in means
-                if baseline_std > 0:
-                    z_score = abs(live_mean - baseline_mean) / baseline_std
+                # Use standard error (σ/√n) for proper hypothesis testing of mean shift
+                n_live = len(X_live[col].dropna())
+                if baseline_std > 0 and n_live > 0:
+                    standard_error = baseline_std / np.sqrt(n_live)
+                    z_score = abs(live_mean - baseline_mean) / standard_error
                 else:
                     z_score = 0.0
                 z_scores[col] = z_score
@@ -117,6 +120,7 @@ class FeatureDriftMonitor:
 class SignalDecayMonitor:
     def __init__(self, decay_alert_threshold: float = 0.52):
         self.decay_alert_threshold = decay_alert_threshold
+        self.latest_auc = 0.0  # Tracks the most recently computed rolling AUC
 
     def monitor(self, predictions: np.ndarray, outcomes: np.ndarray, window: int = 63) -> float:
         """rolling AUC"""
@@ -135,6 +139,7 @@ class SignalDecayMonitor:
             
         try:
             auc = roc_auc_score(outcomes, predictions)
+            self.latest_auc = auc
             if auc < self.decay_alert_threshold:
                 logger.warning(f"Signal decay detected! AUC dropped to {auc:.3f}")
             return auc

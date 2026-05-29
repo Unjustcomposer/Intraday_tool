@@ -1,72 +1,77 @@
 import math
 import logging
+import pandas as pd
+from typing import Dict, List
+import torch
+import numpy as np
+from risk.dpo_layer import DPOLayer
 
 logger = logging.getLogger(__name__)
 
-def kelly_fraction(win_prob: float, win_loss_ratio: float, fraction: float = 0.5) -> float:
+def dpo_position_sizes(returns_df: pd.DataFrame, signals: Dict[str, str], capital: float, gamma: float = 1.0) -> Dict[str, float]:
     """
-    Calculate Kelly criterion position size.
+    Calculate position sizes using Differentiable Portfolio Optimization (DPO).
+    Replaces static Kelly/VaR sizing with Mean-Variance optimization via cvxpylayers.
     
     Args:
-        win_prob: Estimated probability of a winning trade
-        win_loss_ratio: Ratio of average win magnitude to average loss magnitude
-        fraction: Kelly fraction to apply (typically 0.5 for Half-Kelly to reduce volatility)
-    """
-    if win_loss_ratio <= 0:
-        return 0.0
-        
-    kelly_pct = win_prob - ((1 - win_prob) / win_loss_ratio)
-    
-    # Bound between 0 and 1, and apply fractional modifier
-    size = max(0.0, min(1.0, kelly_pct)) * fraction
-    return size
-
-def historical_kelly_fraction(trade_history: list, regime: str = 'quiet', base_fraction: float = 0.5) -> float:
-    """Calculate Kelly fraction from actual trade history with Regime-Conditional scaling"""
-    
-    # Apply regime modifiers (Phase 2 Redesign)
-    regime_scalars = {
-        'quiet': 1.0,           # Max exposure
-        'bull_volatile': 0.5,   # Half exposure
-        'bear_volatile': 0.5,   # Half exposure (0.25 Kelly)
-        'unknown': 0.5
-    }
-    
-    fraction = base_fraction * regime_scalars.get(regime, 0.5)
-    
-    if len(trade_history) < 30:
-        return 0.1 * fraction  # Default safe size if insufficient history
-        
-    wins = [t for t in trade_history if t > 0]
-    losses = [t for t in trade_history if t < 0]
-    
-    if not losses:
-        return 1.0 * fraction
-        
-    win_prob = len(wins) / len(trade_history)
-    avg_win = sum(wins) / len(wins) if wins else 0
-    avg_loss = abs(sum(losses) / len(losses))
-    
-    win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else 0
-    return kelly_fraction(win_prob, win_loss_ratio, fraction)
-
-def volatility_adjusted_size(target_vol: float, asset_vol: float, capital: float) -> float:
-    """
-    Calculate position size to maintain constant risk based on asset volatility.
-    
-    Args:
-        target_vol: Target annualized volatility for the portfolio (e.g., 0.15)
-        asset_vol: Annualized volatility of the asset
+        returns_df: DataFrame of rolling asset returns (columns are symbols)
+        signals: Dict mapping symbol -> 'buy' or 'sell' (or 'no_trade')
         capital: Total capital available
+        gamma: Risk aversion parameter for DPO
     """
-    if asset_vol <= 0:
-        return 0.0
-        
-    vol_scalar = target_vol / asset_vol
-    # Cap leverage at 2x for safety
-    vol_scalar = min(vol_scalar, 2.0)
+    symbols = list(signals.keys())
+    available_syms = [s for s in symbols if s in returns_df.columns]
     
-    return capital * vol_scalar
+    if len(available_syms) < 2:
+        sizes = {}
+        for sym in available_syms:
+            if signals[sym] in ['buy', 'sell']:
+                sizes[sym] = capital / len(available_syms)
+            else:
+                sizes[sym] = 0.0
+        return sizes
+
+    # Use historical mean as proxy for expected returns, adjusted by signal direction
+    mu_hist = returns_df[available_syms].mean().values
+    mu_adjusted = np.zeros_like(mu_hist)
+    
+    for i, sym in enumerate(available_syms):
+        if signals[sym] == 'buy':
+            mu_adjusted[i] = abs(mu_hist[i]) if mu_hist[i] != 0 else 0.001
+        elif signals[sym] == 'sell':
+            # Note: The DPO layer is long-only. For short positions, we would 
+            # ideally modify constraints. Here we provide a negative expected return 
+            # which will result in 0 weight under long-only constraints.
+            mu_adjusted[i] = -abs(mu_hist[i]) if mu_hist[i] != 0 else -0.001
+        else:
+            mu_adjusted[i] = 0.0
+            
+    cov_matrix = returns_df[available_syms].cov().values
+    # Regularize covariance to ensure positive semi-definiteness
+    cov_matrix += np.eye(len(available_syms)) * 1e-6
+    
+    mu_tensor = torch.tensor(mu_adjusted, dtype=torch.float32).unsqueeze(0)
+    Sigma_tensor = torch.tensor(cov_matrix, dtype=torch.float32).unsqueeze(0)
+    
+    try:
+        dpo = DPOLayer(n_assets=len(available_syms), gamma=gamma)
+        weights_batch = dpo(mu_tensor, Sigma_tensor)
+        weights = weights_batch.squeeze(0).detach().numpy()
+    except Exception as e:
+        logger.error(f"DPO optimization failed: {e}")
+        weights = np.ones(len(available_syms)) / len(available_syms)
+        
+    sizes = {}
+    for i, sym in enumerate(available_syms):
+        w = max(0.0, float(weights[i]))
+        # Note: If we want to allow shorting, sizes should just be capital * w * direction
+        # Here we follow the weight magnitude.
+        if signals[sym] in ['buy', 'sell'] and w > 0:
+            sizes[sym] = capital * w
+        else:
+            sizes[sym] = 0.0
+            
+    return sizes
 
 class PortfolioLimits:
     """Enforces absolute portfolio limits"""
@@ -165,4 +170,22 @@ def apply_correlation_discounts(proposed_sizes: Dict[str, float], returns_df: pd
             logger.info(f"Correlation sizing discount for {sym_i}: scaled by {scale_factor:.2f} due to {n_correlated} correlated bets.")
             
     return adjusted_sizes
+
+def kelly_fraction(win_prob: float, win_loss_ratio: float, fraction: float = 0.5) -> float:
+    """
+    Calculate the Kelly fraction.
+    By default, uses half-Kelly (fraction=0.5) to avoid excessive drawdowns.
+    """
+    if win_loss_ratio <= 0:
+        return 0.0
+    f = win_prob - (1.0 - win_prob) / win_loss_ratio
+    return max(0.0, f * fraction)
+
+def volatility_adjusted_size(target_vol: float, asset_vol: float, capital: float) -> float:
+    """
+    Calculate position size adjusted by target volatility vs asset volatility.
+    """
+    if asset_vol <= 0:
+        return 0.0
+    return capital * (target_vol / asset_vol)
 

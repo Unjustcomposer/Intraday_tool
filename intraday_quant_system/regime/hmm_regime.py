@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import logging
-import pickle
+import joblib
 from collections import Counter
 
 try:
@@ -164,15 +164,13 @@ class RegimeDetector:
 
     def save(self, path: str):
         if self.is_fitted:
-            with open(path, 'wb') as f:
-                pickle.dump({
-                    'model': self.model,
-                    'map': self.state_to_regime_map
-                }, f)
+            joblib.dump({
+                'model': self.model,
+                'map': self.state_to_regime_map
+            }, path)
             
     def load(self, path: str):
-        with open(path, 'rb') as f:
-            data = pickle.load(f)
-            self.model = data['model']
-            self.state_to_regime_map = data['map']
+        data = joblib.load(path)
+        self.model = data['model']
+        self.state_to_regime_map = data['map']
         self.is_fitted = True

@@ -3,8 +3,13 @@ def regime_filter(signal: str, regime: str) -> str:
     Filter signals based on current market regime.
     Prevents taking trades in hostile environments.
     
-    Regime names from HMM: 'quiet', 'bull_volatile', 'bear_volatile', 'unknown'
+    Regime names from HMM: 'quiet', 'bull_volatile', 'bear_volatile', 'crisis', 'unknown'
     """
+    if regime == 'crisis':
+        # Crisis regime — block ALL new trades. Capital preservation is paramount.
+        if signal in ('buy', 'sell'):
+            return 'hold'
+    
     if regime == 'bear_volatile':
         # In bear volatile, block new long entries (high risk of drawdown)
         if signal == 'buy':

@@ -38,7 +38,11 @@ transaction_costs:
   gst_pct: 0.18               # 18% GST on brokerage + exchange charges
   sebi_turnover_pct: 0.000001  # SEBI turnover fee
   stamp_duty_buy_pct: 0.00003  # 0.003% on buy side
-  estimated_slippage_pct: 0.001  # 0.1% baseline slippage
+  estimated_slippage_pct: 0.0005  # 0.05% baseline slippage (large-cap NSE)
+  # Tiered slippage by market cap (used by execution engine)
+  slippage_large_cap_pct: 0.0003   # 0.03% — NIFTY 50 constituents
+  slippage_mid_cap_pct: 0.001      # 0.10% — NIFTY Midcap 150
+  slippage_small_cap_pct: 0.003    # 0.30% — below Midcap 150
 
 # Risk parameters
 risk:

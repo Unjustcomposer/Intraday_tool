@@ -1,7 +1,8 @@
 import logging
 import time
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pandas as pd
@@ -91,6 +92,13 @@ class PipelineRunner:
         self._sentiment_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='finbert')
         self._latest_sentiment = {}   # {symbol: {'score': float, 'timestamp': datetime}}
         
+        # Real-Time Kill Switch thread
+        self._killswitch_thread = None
+        self._killswitch_running = False
+        
+        # Process Pool for heavy ML inference
+        self._inference_pool = ProcessPoolExecutor(max_workers=2)
+        
         # Risk & Execution
         self.risk_monitor = PortfolioRiskMonitor(config={'risk': self.config.risk.__dict__, 'max_capital': self.config.max_capital})
         self.stop_engine = VolatilityStopEngine()
@@ -162,6 +170,12 @@ class PipelineRunner:
             CronTrigger(day_of_week='mon-fri', hour=15, minute='15-30', timezone='Asia/Kolkata')
         )
         
+        # Start Real-Time News Kill Switch
+        if not self._killswitch_running:
+            self._killswitch_running = True
+            self._killswitch_thread = threading.Thread(target=self._news_killswitch_loop, daemon=True)
+            self._killswitch_thread.start()
+        
         # End of day wrap-up
         self.scheduler.add_job(
             self.end_of_day_routine,
@@ -187,9 +201,16 @@ class PipelineRunner:
                 if not df.empty:
                     self._market_cache[sym] = df
             
-            # Fetch overnight news
+            # Fetch overnight news and generate daily static sentiment bias
             articles = self.news_fetcher.fetch_recent_news(hours_back=18, symbols=self.config.universe)
             self.news_fetcher.store_news(articles)
+            
+            for sym in self.config.universe:
+                sym_articles = [a for a in articles if a.get('symbol', '').upper() == sym.upper()]
+                if sym_articles and self.sentiment_engine.is_ready:
+                    res = self.sentiment_engine.analyze(sym_articles[0].get('headline', ''))
+                    self._latest_sentiment[sym] = {'data': res, 'timestamp': ist_now}
+                    
         except Exception as e:
             logger.error(f"Error in market open prep: {e}", exc_info=True)
 
@@ -218,6 +239,27 @@ class PipelineRunner:
             self.log_audit_event("RETRAIN_COMPLETED", {"status": "success"})
         except Exception as e:
             logger.error(f"Online retraining failed: {e}")
+
+    def _news_killswitch_loop(self):
+        """Continuously polls for black-swan news and halts trading if found."""
+        logger.info("Real-Time NLP Kill Switch active.")
+        fatal_keywords = ["fraud", "default", "hindenburg", "resigns", "scam", "bankruptcy"]
+        while self._killswitch_running:
+            try:
+                # In production, this would subscribe to a fast-path WebSocket
+                # Here we simulate periodic polling of the high-priority news feed
+                articles = self.news_fetcher.fetch_recent_news(hours_back=1)
+                for article in articles:
+                    headline = article.get('headline', '').lower()
+                    if any(kw in headline for kw in fatal_keywords):
+                        logger.critical(f"BLACK SWAN EVENT DETECTED: {headline}. Halting trading immediately!")
+                        self.risk_monitor.trading_halted = True
+                        self.log_audit_event("NEWS_KILLSWITCH_TRIGGERED", {"headline": headline})
+                        self.enforce_hard_exit()
+                        break
+            except Exception as e:
+                logger.debug(f"Kill switch poll error: {e}")
+            time.sleep(5)  # Poll every 5 seconds
 
     def main_loop(self):
         """
@@ -276,9 +318,9 @@ class PipelineRunner:
                         df = df.iloc[-500:]
                     self._market_cache[symbol] = df
                 
-                # 2. Async sentiment (non-blocking)
+                # 2. Daily static sentiment (Pre-market bias)
+                # We no longer trigger async fetches intraday to save latency
                 sentiment_data = self._latest_sentiment.get(symbol, {}).get('data')
-                self._schedule_sentiment_update(symbol)
                 
                 # Performance profiling: Feature computation latency
                 t_features_start = time.perf_counter()
@@ -342,6 +384,7 @@ class PipelineRunner:
                 
                 # Secondary Gate: CatBoost Meta-Labeler
                 meta_prob = self.meta_labeler.predict_proba(latest_features, np.array([lgbm_prob]))[0]
+                conformal_gate = getattr(self.meta_labeler, 'conformal_threshold', 0.50)
                 
                 t_inference = time.perf_counter() - t_inference_start
                 self.exporter.update_metric('quant_latency_inference', t_inference)
@@ -357,6 +400,7 @@ class PipelineRunner:
                     xgboost_prob=xgb_prob,
                     tft_prob=tft_prob,
                     meta_prob=meta_prob,
+                    meta_gate=conformal_gate,
                     sentiment_score=sentiment_score,
                     regime_score=regime_exposure,
                     regime=current_regime
@@ -435,7 +479,7 @@ class PipelineRunner:
                     'quant_drawdown': float(status['drawdown']),
                     'quant_regime': float(encoded_regime),
                     'quant_vix': float(vix),
-                    'quant_signal_auc': float(self.signal_monitor.decay_alert_threshold)  # Static baseline threshold for AUC comparison
+                    'quant_signal_auc': float(self.signal_monitor.latest_auc)  # Actual computed rolling AUC (0.0 if not yet computed)
                 })
                 
             except Exception as e:
@@ -520,5 +564,9 @@ class PipelineRunner:
     def stop(self):
         if self.is_running:
             self.scheduler.shutdown()
+            self._killswitch_running = False
+            if self._killswitch_thread:
+                self._killswitch_thread.join(timeout=2.0)
+            self._inference_pool.shutdown(wait=False)
             self.is_running = False
             logger.info("Pipeline runner stopped.")

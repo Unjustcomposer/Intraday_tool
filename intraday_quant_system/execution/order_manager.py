@@ -1,8 +1,9 @@
 import logging
 import pandas as pd
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from risk.position_sizing import kelly_fraction, volatility_adjusted_size, PortfolioLimits
+from .algorithms import TWAP, VWAP, AlmgrenChriss, Iceberg
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,9 @@ class OrderManager:
         
         # Track open orders for 30s conversion logic
         self.open_orders: Dict[str, Dict] = {} # order_id -> {symbol, timestamp, ...}
+        
+        # Track active execution algorithms
+        self.active_algorithms: Dict[str, Dict] = {} # symbol -> {algo, price, regime, ...}
 
     def process_signals(self, signals_df: pd.DataFrame, current_prices: Dict[str, float],
                         market_data: pd.DataFrame = None, features_data: Dict[str, pd.Series] = None):
@@ -128,26 +132,53 @@ class OrderManager:
                     logger.info(f"Position sizing returned 0 for {symbol}. Skipping.")
                     continue
                 
-                logger.info(f"Executing {side} for {quantity} shares of {symbol} "
-                           f"(vol={vol_val:.2f}, regime={regime}, conf={confidence:.2f})")
+                LARGE_ORDER_THRESHOLD = 5000
+                if quantity >= LARGE_ORDER_THRESHOLD:
+                    logger.info(f"Large order of {quantity} for {symbol}. Routing via Algorithmic Execution.")
+                    end_time = now + timedelta(minutes=30)
+                    algo = TWAP(symbol, quantity, side, now, end_time, slices=10)
+                    self.active_algorithms[symbol] = {
+                        'algo': algo,
+                        'price': price,
+                        'regime': regime,
+                        'vol_val': vol_val
+                    }
+                    slice_qty = algo.get_next_slice(now)
+                    if slice_qty <= 0:
+                        continue
+                    current_qty = slice_qty
+                    logger.info(f"Executing ALGO slice {side} for {current_qty} shares of {symbol}")
+                else:
+                    current_qty = quantity
+                    logger.info(f"Executing {side} for {current_qty} shares of {symbol} "
+                               f"(vol={vol_val:.2f}, regime={regime}, conf={confidence:.2f})")
+                
                 order_id = self.exec_engine.place_order(
                     symbol=symbol,
-                    quantity=quantity,
+                    quantity=current_qty,
                     side=side,
                     order_type="LIMIT",
                     price=price
                 )
                 
                 if order_id:
-                    # Estimate initial queue position based on book depth
+                    # Estimate initial queue position and OIB based on L2 book depth
                     queue_pos = 1000.0  # default simulation value
+                    oib = 0.0
                     if market_data is not None and not market_data.empty:
                         sym_data = market_data[market_data['symbol'] == symbol]
                         if not sym_data.empty:
-                            if side == "BUY" and 'bid_volume' in sym_data.columns:
-                                queue_pos = float(sym_data['bid_volume'].iloc[-1])
-                            elif side == "SELL" and 'ask_volume' in sym_data.columns:
-                                queue_pos = float(sym_data['ask_volume'].iloc[-1])
+                            if 'bid_volume_1' in sym_data.columns and 'ask_volume_1' in sym_data.columns:
+                                bv = float(sym_data['bid_volume_1'].iloc[-1])
+                                av = float(sym_data['ask_volume_1'].iloc[-1])
+                                if bv + av > 0:
+                                    oib = (bv - av) / (bv + av)
+                                queue_pos = bv if side == "BUY" else av
+                            else:
+                                if side == "BUY" and 'bid_volume' in sym_data.columns:
+                                    queue_pos = float(sym_data['bid_volume'].iloc[-1])
+                                elif side == "SELL" and 'ask_volume' in sym_data.columns:
+                                    queue_pos = float(sym_data['ask_volume'].iloc[-1])
                                 
                     # Track for timeouts and queue position estimation
                     self.open_orders[order_id] = {
@@ -155,10 +186,11 @@ class OrderManager:
                         'timestamp': now,
                         'side': side,
                         'regime': regime,
-                        'qty': quantity,
+                        'qty': current_qty,
                         'price': price,
                         'queue_pos': queue_pos,
-                        'initial_queue_pos': queue_pos
+                        'initial_queue_pos': queue_pos,
+                        'oib': oib
                     }
                     
                     # Set initial stop loss using real volatility
@@ -385,6 +417,36 @@ class OrderManager:
                 }
                 del self.open_orders[order_id]
                 
+        # 1.5 Handle active algorithms (slice generation)
+        for symbol, algo_info in list(self.active_algorithms.items()):
+            algo = algo_info['algo']
+            slice_qty = algo.get_next_slice(now)
+            if slice_qty > 0 and symbol in current_prices:
+                price = current_prices[symbol]
+                logger.info(f"Executing ALGO slice {algo.side} for {slice_qty} shares of {symbol}")
+                order_id = self.exec_engine.place_order(
+                    symbol=symbol,
+                    quantity=slice_qty,
+                    side=algo.side,
+                    order_type="LIMIT",
+                    price=price
+                )
+                if order_id:
+                    self.open_orders[order_id] = {
+                        'symbol': symbol,
+                        'timestamp': now,
+                        'side': algo.side,
+                        'regime': algo_info['regime'],
+                        'qty': slice_qty,
+                        'price': price,
+                        'queue_pos': 1000.0,
+                        'initial_queue_pos': 1000.0,
+                        'oib': 0.0
+                    }
+            if not algo.is_active:
+                logger.info(f"Algorithm finished for {symbol}")
+                del self.active_algorithms[symbol]
+
         if self.check_hard_exit():
             self.liquidate_all(current_prices)
             return

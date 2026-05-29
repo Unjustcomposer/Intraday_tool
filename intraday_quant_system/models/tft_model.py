@@ -1,3 +1,4 @@
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,7 +13,7 @@ from typing import Dict, Any, Tuple, List
 logger = logging.getLogger(__name__)
 
 class TFTNetwork(nn.Module):
-    def __init__(self, input_dim: int, embed_dim: int = 64, nhead: int = 4, num_layers: int = 2, dropout: int = 0.1):
+    def __init__(self, input_dim: int, embed_dim: int = 64, nhead: int = 4, num_layers: int = 2, dropout: float = 0.1):
         super().__init__()
         self.input_projection = nn.Linear(input_dim, embed_dim)
         
@@ -46,8 +47,12 @@ class TFTNetwork(nn.Module):
         # x shape: (batch_size, seq_len, input_dim)
         x = self.input_projection(x)
         
+        # Generate causal mask to prevent attending to future positions (data leakage)
+        seq_len = x.size(1)
+        mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device)
+        
         # Transformer expects (batch_size, seq_len, embed_dim) with batch_first=True
-        out = self.transformer(x)
+        out = self.transformer(x, mask=mask)
         
         # Use the last time step for prediction
         last_step_out = out[:, -1, :]
@@ -146,10 +151,10 @@ class TemporalFusionTransformerModel:
             self.model.train()
             train_loss = 0
             
-            # Simple batching
-            permutation = torch.randperm(X_train_t.size()[0])
+            # Sequential batching to preserve temporal order (no random shuffling)
+            indices_order = torch.arange(X_train_t.size()[0])
             for i in range(0, X_train_t.size()[0], batch_size):
-                indices = permutation[i:i+batch_size]
+                indices = indices_order[i:i+batch_size]
                 batch_x, batch_y = X_train_t[indices], y_train_t[indices]
                 
                 optimizer.zero_grad()
@@ -170,7 +175,7 @@ class TemporalFusionTransformerModel:
                 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_model_state = self.model.state_dict().copy()
+                best_model_state = copy.deepcopy(self.model.state_dict())
                 patience_counter = 0
             else:
                 patience_counter += 1
@@ -227,7 +232,7 @@ class TemporalFusionTransformerModel:
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Model file not found: {filepath}")
             
-        state = torch.load(filepath, map_location=torch.device('cpu'))
+        state = torch.load(filepath, map_location=torch.device('cpu'), weights_only=True)
         instance = cls(state.get('config', {}))
         
         instance.model = TFTNetwork(

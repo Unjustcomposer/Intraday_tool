@@ -235,35 +235,18 @@ class MarketDataEngine:
                     / df.loc[bid_ask_available, 'close']
                 )
             
-            # Add Options Flow and Cross-Asset columns (Simulated/Moked for paper trading)
-            np.random.seed(42)  # For consistent mock behavior
-            n_rows = len(df)
-            
-            # 1. Put/Call Ratio (PCR): mean-reverting around 1.0
-            pcr = 1.0 + np.sin(np.linspace(0, 10, n_rows)) * 0.2 + np.random.normal(0, 0.05, n_rows)
-            df['options_pcr'] = pcr
-            
-            # 2. Max Pain Strike: stock price rounded to nearest 50 strike increment
-            df['options_max_pain'] = np.round(df['close'] / 50.0) * 50.0
-            
-            # 3. Unusual Options OI Buildup: 0 or 1 indicator
-            df['options_unusual_oi'] = np.random.choice([0, 1], size=n_rows, p=[0.95, 0.05])
-            
-            # 4. Nifty Futures Basis: +0.1% premium with minor volatility
-            df['nifty_futures_basis'] = df['close'] * 0.001 + np.random.normal(0, df['close'] * 0.0002, n_rows)
-            
-            # 5. FII / DII Daily Net Flow (Cr INR): constant per calendar day
-            if 'timestamp' in df.columns:
-                dates = pd.to_datetime(df['timestamp']).dt.date
-            else:
-                dates = pd.Series(datetime.now().date(), index=df.index)
-            
-            unique_dates = np.unique(dates)
-            fii_flows = dict(zip(unique_dates, np.random.uniform(-1500, 1500, len(unique_dates))))
-            dii_flows = dict(zip(unique_dates, np.random.uniform(-1000, 1000, len(unique_dates))))
-            
-            df['fii_net_flow'] = [fii_flows[d] for d in dates]
-            df['dii_net_flow'] = [dii_flows[d] for d in dates]
+            # Options Flow and Cross-Asset columns
+            # NOTE: These require REAL data sources (NSE Option Chain API, FII/DII data from NSDL).
+            # Set to NaN to honestly represent missing data. Models should NOT train on these
+            # until real data connectors are implemented.
+            # Previous implementation used np.random.seed(42) to generate fake data,
+            # which caused models to learn noise patterns as their top features.
+            df['options_pcr'] = np.nan
+            df['options_max_pain'] = np.nan
+            df['options_unusual_oi'] = np.nan
+            df['nifty_futures_basis'] = np.nan
+            df['fii_net_flow'] = np.nan
+            df['dii_net_flow'] = np.nan
             
             # Reorder columns
             cols = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'vwap',

@@ -88,11 +88,25 @@ class FeatureStore:
         # === Drop highly correlated features ===
         features = self._drop_correlated_features(features, threshold=0.95)
         
-        # Track feature columns (exclude raw OHLCV and metadata)
+        # Track feature columns (exclude raw OHLCV, metadata, AND unimplemented mock data columns)
         raw_cols = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                     'vwap', 'bid_price', 'ask_price', 'bid_volume', 'ask_volume',
                     'oi', 'spread', 'trade_count', 'aggressor_side']
-        self._feature_columns = [c for c in features.columns if c not in raw_cols]
+        # Columns that require real data sources not yet implemented.
+        # These are NaN placeholders and must NOT be used as model features.
+        unimplemented_cols = ['options_pcr', 'options_max_pain', 'options_unusual_oi',
+                              'nifty_futures_basis', 'fii_net_flow', 'dii_net_flow',
+                              'options_pcr_ratio', 'options_max_pain_dev', 
+                              'options_unusual_oi', 'nifty_basis_pct', 'fii_dii_flow_mom']
+        exclude_cols = set(raw_cols) | set(unimplemented_cols)
+        
+        # Also exclude any all-NaN columns as a safety net
+        all_nan_cols = [c for c in features.columns if features[c].isna().all()]
+        if all_nan_cols:
+            logger.warning(f"Excluding {len(all_nan_cols)} all-NaN feature columns: {all_nan_cols}")
+        exclude_cols.update(all_nan_cols)
+        
+        self._feature_columns = [c for c in features.columns if c not in exclude_cols]
         
         return features
     

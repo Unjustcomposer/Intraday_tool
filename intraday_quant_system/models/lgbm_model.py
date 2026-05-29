@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 import logging
-import pickle
+
 import json
 import os
 from datetime import datetime
@@ -220,10 +220,9 @@ class LGBMAlphaModel:
         return df.sort_values('importance', ascending=False)
 
     def save(self, path: str):
-        """Save model with version metadata"""
+        """Save model using native LightGBM format (no pickle) with JSON sidecar metadata"""
         if self.is_fitted:
-            with open(path, 'wb') as f:
-                pickle.dump(self.model, f)
+            self.model.booster_.save_model(path)
             
             # Save metadata alongside
             meta_path = path + '.meta.json'
@@ -238,8 +237,11 @@ class LGBMAlphaModel:
             logger.info(f"Saved model v{self.version} to {path}")
             
     def load(self, path: str):
-        with open(path, 'rb') as f:
-            self.model = pickle.load(f)
+        """Load model using native LightGBM Booster (no pickle)"""
+        booster = lgb.Booster(model_file=path)
+        self.model = lgb.LGBMClassifier(**self.params)
+        self.model._Booster = booster
+        self.model._n_classes = 2
         self.is_fitted = True
         
         meta_path = path + '.meta.json'

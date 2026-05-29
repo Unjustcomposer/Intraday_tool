@@ -38,6 +38,7 @@ class MetaLabeler:
         self.is_fitted = False
         self.version: str = ""
         self.train_metrics: dict = {}
+        self.conformal_threshold: float = 0.50
 
     def train(self, X_primary_preds: np.ndarray, X_features: pd.DataFrame, y_trade_outcome: pd.Series, val_size: float = 0.2):
         """
@@ -121,39 +122,79 @@ class MetaLabeler:
                     fold_auc = 0.5
                 val_aucs.append(fold_auc)
                 logger.info(f"Fold {fold+1} complete. Best Iteration: {best_iter}, Val AUC: {fold_auc:.4f}")
+                last_successful_model = fold_model
+                last_fold_train_size = train_end_purged
+                
+                # Conformal Prediction Calibration: Find tau such that precision >= 60%
+                sorted_probs = np.sort(va_probs)
+                best_tau = 0.50
+                for tau in sorted_probs:
+                    preds = (va_probs > tau).astype(int)
+                    if preds.sum() == 0:
+                        break
+                    precision = y_va[preds == 1].mean()
+                    if precision >= 0.60:
+                        best_tau = tau
+                        break
+                last_fold_conformal = float(best_tau)
+                
             except Exception as e:
                 logger.error(f"Failed to train Fold {fold+1}: {e}")
                 
-        # Final model fit using optimal parameters derived from CV
+        # Use last fold's model as production model to prevent label contamination.
+        # Refitting on ALL data would let the model see labels it will predict on.
         if best_iterations:
-            avg_best_iter = max(10, int(np.mean(best_iterations)))
             avg_val_auc = float(np.mean(val_aucs))
+            avg_best_iter = max(10, int(np.mean(best_iterations)))
             logger.info(f"Walk-Forward CV complete. Avg Best Iteration: {avg_best_iter}, Avg Val AUC: {avg_val_auc:.4f}")
+            
+            # Use the last fold's already-fitted model directly (no refit)
+            self.model = last_successful_model
+            n_train = last_fold_train_size
+            self.conformal_threshold = last_fold_conformal
+            logger.info(f"Conformal Calibration Threshold: {self.conformal_threshold:.4f}")
         else:
-            avg_best_iter = self.model.get_params().get('iterations', 800)
+            # Fallback: no folds succeeded, fit on first 80% only (never all data)
+            logger.warning("No walk-forward folds succeeded. Falling back to 80/20 train split.")
             avg_val_auc = 0.5
+            avg_best_iter = self.model.get_params().get('iterations', 800)
             
-        final_params = self.model.get_params().copy()
-        final_params['iterations'] = avg_best_iter
-        if 'early_stopping_rounds' in final_params:
-            del final_params['early_stopping_rounds']
+            fallback_split = int(total_len * 0.8)
+            X_fb_train = X_combined.iloc[:fallback_split]
+            y_fb_train = y_trade_outcome.iloc[:fallback_split]
+            X_fb_val = X_combined.iloc[fallback_split:]
+            y_fb_val = y_trade_outcome.iloc[fallback_split:]
             
-        self.model = CatBoostClassifier(**final_params)
-        final_pool = Pool(X_combined, y_trade_outcome, cat_features=cat_features if cat_features else None)
-        self.model.fit(final_pool, verbose=False)
+            fb_pool = Pool(X_fb_train, y_fb_train, cat_features=cat_features if cat_features else None)
+            fb_val_pool = Pool(X_fb_val, y_fb_val, cat_features=cat_features if cat_features else None)
+            self.model = CatBoostClassifier(
+                iterations=avg_best_iter,
+                learning_rate=0.05,
+                depth=5,
+                l2_leaf_reg=10.0,
+                loss_function='Logloss',
+                eval_metric='AUC',
+                verbose=False,
+                random_seed=42,
+                early_stopping_rounds=50,
+            )
+            self.model.fit(fb_pool, eval_set=fb_val_pool, use_best_model=True, verbose=False)
+            n_train = fallback_split
+            self.conformal_threshold = 0.50
         
         self.is_fitted = True
         self.version = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        self.train_metrics = {
+        self.metadata = {
             'val_auc': avg_val_auc,
             'best_iteration': avg_best_iter,
-            'n_train': len(X_combined),
+            'n_train': n_train,
             'n_splits_cv': len(best_iterations),
+            'conformal_threshold': self.conformal_threshold,
             'version': self.version,
         }
         
-        logger.info(f"MetaLabeler final training complete. Version: {self.version}")
+        logger.info(f"MetaLabeler training complete. Version: {self.version} (used last fold model, no refit)")
 
     def predict_proba(self, X: pd.DataFrame, primary_preds: np.ndarray = None) -> np.ndarray:
         """Confidence that trade is worth taking"""
@@ -172,7 +213,7 @@ class MetaLabeler:
             self.model.save_model(path)
             meta_path = path + '.meta.json'
             with open(meta_path, 'w') as f:
-                json.dump({'version': self.version, 'metrics': self.train_metrics}, f, indent=2, default=str)
+                json.dump({'version': self.version, 'conformal_threshold': self.conformal_threshold, 'metrics': self.train_metrics}, f, indent=2, default=str)
             
     def load(self, path: str):
         self.model.load_model(path)
@@ -182,4 +223,5 @@ class MetaLabeler:
             with open(meta_path, 'r') as f:
                 meta = json.load(f)
                 self.version = meta.get('version', 'unknown')
+                self.conformal_threshold = meta.get('conformal_threshold', 0.50)
                 self.train_metrics = meta.get('metrics', {})

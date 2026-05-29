@@ -328,19 +328,27 @@ def _compute_metrics(trades: list, model, y_val, probs) -> dict:
     profit_factor = (np.sum(wins) / np.sum(np.abs(losses))) if len(losses) > 0 and np.sum(np.abs(losses)) > 0 else 0
     
     # Sharpe from trade returns (annualize using actual trade frequency)
-    if np.std(returns) > 0:
+    # NOTE: Requires minimum 30 trades for statistical significance
+    if np.std(returns) > 0 and len(returns) >= 30:
         # Estimate trades per year from actual duration
         avg_duration_bars = np.mean(durations) if len(durations) > 0 else 10
         trades_per_day = 75.0 / max(avg_duration_bars, 1)  # 75 bars per day
         trades_per_year = trades_per_day * 252
         sharpe = np.mean(returns) / np.std(returns) * np.sqrt(trades_per_year)
+    elif np.std(returns) > 0:
+        # Compute but flag as unreliable
+        avg_duration_bars = np.mean(durations) if len(durations) > 0 else 10
+        trades_per_year = (75.0 / max(avg_duration_bars, 1)) * 252
+        sharpe = np.mean(returns) / np.std(returns) * np.sqrt(trades_per_year)
+        logger.warning(f"Sharpe computed from only {len(returns)} trades (<30) — NOT statistically significant")
     else:
         sharpe = 0
     
-    # Max drawdown on cumulative equity curve
-    cum_returns = np.cumsum(returns)
-    running_max = np.maximum.accumulate(cum_returns)
-    drawdowns = running_max - cum_returns
+    # Max drawdown on compounded equity curve (not cumulative sum)
+    # cumsum of % returns is incorrect for large returns; cumprod reflects real equity
+    equity_curve = np.cumprod(1 + returns)
+    running_max = np.maximum.accumulate(equity_curve)
+    drawdowns = (running_max - equity_curve) / running_max  # Percentage drawdown
     max_dd = np.max(drawdowns) if len(drawdowns) > 0 else 0
     
     # Sortino ratio (proper downside deviation)

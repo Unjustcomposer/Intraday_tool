@@ -342,9 +342,10 @@ class IntradayAnalyzer:
         df["EMA_9"] = df["Close"].ewm(span=9, adjust=False).mean()
         df["EMA_21"] = df["Close"].ewm(span=21, adjust=False).mean()
 
+        # RSI using Wilder's smoothing (EMA with alpha=1/14, equivalent to com=13)
         delta = df["Close"].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        gain = delta.where(delta > 0, 0).ewm(com=13, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
         rs = gain / loss
         df["RSI"] = 100 - (100 / (1 + rs))
 
@@ -353,10 +354,14 @@ class IntradayAnalyzer:
         df["MACD"] = ema12 - ema26
         df["Signal_Line"] = df["MACD"].ewm(span=9, adjust=False).mean()
 
-        df["VWAP"] = (
-            (df["Volume"] * (df["High"] + df["Low"] + df["Close"]) / 3).cumsum()
-            / df["Volume"].cumsum()
-        )
+        # VWAP with proper daily reset (cumulative within each trading day only)
+        typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
+        vol_tp = df["Volume"] * typical_price
+        if hasattr(df.index, 'date'):
+            day_groups = pd.Series(df.index.date, index=df.index)
+        else:
+            day_groups = pd.Series(0, index=df.index)  # Fallback: treat as single day
+        df["VWAP"] = vol_tp.groupby(day_groups).cumsum() / df["Volume"].groupby(day_groups).cumsum()
 
         hl = df["High"] - df["Low"]
         hc = np.abs(df["High"] - df["Close"].shift())

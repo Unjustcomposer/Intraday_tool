@@ -87,9 +87,9 @@ class TickerProcess:
             self.disconnect_start_time = time.time()
 
     async def _monitor_connection_async(self):
-        """Asynchronously monitor connection health and trigger kill-switch if disconnected or latency > 500ms"""
+        """Asynchronously monitor connection health and trigger kill-switch if disconnected > 30 seconds"""
         while True:
-            await asyncio.sleep(0.1)  # High-frequency check (100ms) for sub-second latency
+            await asyncio.sleep(1.0)  # 1-second check interval
             if self.kill_switch_activated:
                 continue
                 
@@ -100,9 +100,13 @@ class TickerProcess:
                 
             latency = now - self.last_tick_time
             
-            # Heartbeat check: disconnect or latency > 500ms (0.5s)
-            if not self.is_connected or latency > 0.5:
-                logger.critical(f"HEARTBEAT FAILURE: WebSocket connected={self.is_connected} | Latency={latency*1000:.1f}ms exceeds 500ms limit!")
+            # Latency warning at 2 seconds (log only, no kill switch)
+            if latency > 2.0 and latency <= 30.0:
+                logger.warning(f"LATENCY WARNING: WebSocket latency={latency:.1f}s exceeds 2s threshold. Monitoring...")
+            
+            # Kill-switch: disconnect or latency > 30 seconds
+            if not self.is_connected or latency > 30.0:
+                logger.critical(f"HEARTBEAT FAILURE: WebSocket connected={self.is_connected} | Latency={latency:.1f}s exceeds 30s limit!")
                 self.activate_kill_switch()
 
     def activate_kill_switch(self):

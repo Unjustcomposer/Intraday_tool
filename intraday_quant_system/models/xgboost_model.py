@@ -163,7 +163,9 @@ class XGBoostAlphaModel:
         if not all(col in df.columns for col in ['close', 'atr']):
             raise ValueError("DataFrame must contain 'close' and 'atr' columns to make labels.")
             
-        bars_forward = horizon_minutes // 5  # Assuming 5-min bars
+        # NOTE: horizon_minutes is a misnomer — it represents horizon_bars
+        # (number of bars to look forward), matching LGBM's make_labels behavior.
+        bars_forward = horizon_minutes
         
         labels = pd.Series(np.nan, index=df.index)
         closes = df['close'].values

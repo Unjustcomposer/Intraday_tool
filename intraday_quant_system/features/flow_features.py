@@ -47,9 +47,12 @@ def vwap_deviation(df: pd.DataFrame) -> pd.Series:
 def volume_delta(df: pd.DataFrame) -> pd.Series:
     """cumulative buy_vol - sell_vol, reset daily to prevent monotonic growth.
     Approximated via aggressor side or price change if aggressor side not available."""
-    if 'aggressor_side' in df.columns and 'volume' in df.columns:
+    # Check if aggressor_side has ACTUAL data (not just the column with all NaN)
+    if ('aggressor_side' in df.columns and 'volume' in df.columns 
+            and df['aggressor_side'].notna().any()):
         signed_vol = df['volume'] * df['aggressor_side']
     elif 'close' in df.columns and 'open' in df.columns and 'volume' in df.columns:
+        # Tick rule approximation: sign volume by intra-bar direction
         direction = np.sign(df['close'] - df['open'])
         signed_vol = df['volume'] * direction
     else:
@@ -67,7 +70,7 @@ def volume_delta(df: pd.DataFrame) -> pd.Series:
     date_series = pd.Series(dates, index=df.index)
     return signed_vol.groupby(date_series).cumsum()
 
-def kyles_lambda(df: pd.DataFrame, window: int = 20) -> pd.Series:
+def kyles_lambda(df: pd.DataFrame, window: int = 60) -> pd.Series:
     """
     Kyle's Lambda: short-term price impact parameter.
     Lambda = Cov(Price_Diff, Signed_Volume) / Var(Signed_Volume)
@@ -85,15 +88,15 @@ def kyles_lambda(df: pd.DataFrame, window: int = 20) -> pd.Series:
         direction = np.sign(price_diff)
         signed_vol = df['volume'] * direction
         
-    # Compute rolling covariance and variance
-    cov = price_diff.rolling(window=window).cov(signed_vol)
-    var = signed_vol.rolling(window=window).var()
+    # Compute EWMA covariance and variance to reduce statistical noise
+    cov = price_diff.ewm(span=window, min_periods=window//2).cov(signed_vol)
+    var = signed_vol.ewm(span=window, min_periods=window//2).var()
     
     # Fill NAs and scale lambda
     k_lambda = cov / var.replace(0, np.nan)
     return k_lambda.fillna(0.0)
 
-def amihud_illiquidity(df: pd.DataFrame, window: int = 20) -> pd.Series:
+def amihud_illiquidity(df: pd.DataFrame, window: int = 60) -> pd.Series:
     """
     Amihud Illiquidity Ratio: |Return| / Dollar (Rupee) Volume
     """
@@ -104,7 +107,7 @@ def amihud_illiquidity(df: pd.DataFrame, window: int = 20) -> pd.Series:
     rupee_volume = df['volume'] * df['close']
     
     ratio = returns / rupee_volume.replace(0, np.nan)
-    amihud = ratio.rolling(window=window).mean()
+    amihud = ratio.ewm(span=window, min_periods=window//2).mean()
     return amihud.fillna(0.0)
 
 def trade_size_distribution(df: pd.DataFrame, window: int = 20) -> pd.Series:

@@ -56,33 +56,44 @@ def sector_rotation_score(sector_returns: pd.DataFrame) -> dict:
     return scores
 
 def options_pcr_ratio(df: pd.DataFrame, window: int = 20) -> pd.Series:
-    """Rolling average of Put/Call Ratio (PCR)"""
-    if 'options_pcr' not in df.columns:
-        return pd.Series(1.0, index=df.index)
-    return df['options_pcr'].rolling(window=window).mean().fillna(1.0)
+    """Rolling average of Put/Call Ratio (PCR).
+    Requires real NSE Option Chain data — returns NaN when unavailable."""
+    if 'options_pcr' not in df.columns or df['options_pcr'].isna().all():
+        return pd.Series(np.nan, index=df.index)
+    return df['options_pcr'].rolling(window=window).mean()
 
 def options_max_pain_deviation(df: pd.DataFrame) -> pd.Series:
-    """Deviation of current price from options max pain strike"""
+    """Deviation of current price from options max pain strike.
+    Requires real NSE Option Chain data — returns NaN when unavailable."""
     if 'close' not in df.columns or 'options_max_pain' not in df.columns:
-        return pd.Series(0.0, index=df.index)
-    return ((df['close'] - df['options_max_pain']) / df['close']).fillna(0.0)
+        return pd.Series(np.nan, index=df.index)
+    if df['options_max_pain'].isna().all():
+        return pd.Series(np.nan, index=df.index)
+    return (df['close'] - df['options_max_pain']) / df['close']
 
 def options_unusual_oi_signal(df: pd.DataFrame, window: int = 10) -> pd.Series:
-    """Indicator of recent unusual options open interest buildup"""
-    if 'options_unusual_oi' not in df.columns:
-        return pd.Series(0.0, index=df.index)
-    return df['options_unusual_oi'].rolling(window=window).sum().fillna(0.0)
+    """Indicator of recent unusual options open interest buildup.
+    Requires real NSE Option Chain data — returns NaN when unavailable."""
+    if 'options_unusual_oi' not in df.columns or df['options_unusual_oi'].isna().all():
+        return pd.Series(np.nan, index=df.index)
+    return df['options_unusual_oi'].rolling(window=window).sum()
 
 def nifty_futures_basis_pct(df: pd.DataFrame) -> pd.Series:
-    """Nifty Futures Basis as % of asset close price"""
+    """Nifty Futures Basis as % of asset close price.
+    Requires real NSE Futures data — returns NaN when unavailable."""
     if 'close' not in df.columns or 'nifty_futures_basis' not in df.columns:
-        return pd.Series(0.0, index=df.index)
-    return (df['nifty_futures_basis'] / df['close']).fillna(0.0)
+        return pd.Series(np.nan, index=df.index)
+    if df['nifty_futures_basis'].isna().all():
+        return pd.Series(np.nan, index=df.index)
+    return df['nifty_futures_basis'] / df['close']
 
 def fii_dii_net_flow_momentum(df: pd.DataFrame, window: int = 5) -> pd.Series:
-    """Rolling momentum of combined FII and DII daily net flows (Cr INR)"""
+    """Rolling momentum of combined FII and DII daily net flows (Cr INR).
+    Requires real NSDL/CDSL FII/DII data — returns NaN when unavailable."""
     if 'fii_net_flow' not in df.columns or 'dii_net_flow' not in df.columns:
-        return pd.Series(0.0, index=df.index)
+        return pd.Series(np.nan, index=df.index)
+    if df['fii_net_flow'].isna().all() or df['dii_net_flow'].isna().all():
+        return pd.Series(np.nan, index=df.index)
     combined = df['fii_net_flow'] + df['dii_net_flow']
-    return combined.rolling(window=window).mean().fillna(0.0)
+    return combined.rolling(window=window).mean()
 

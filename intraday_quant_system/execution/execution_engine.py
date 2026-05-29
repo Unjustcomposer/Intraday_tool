@@ -15,9 +15,10 @@ class APICircuitBreaker:
     Lightweight circuit breaker for broker API calls.
     If 3 failures occur within 30 seconds, the circuit opens for 60 seconds.
     """
-    def __init__(self, max_failures: int = 3, reset_timeout: float = 60.0, window: float = 30.0):
+    def __init__(self, max_failures: int = 3, window: float = 30.0):
         self.max_failures = max_failures
-        self.reset_timeout = reset_timeout
+        self.backoff_levels = [60.0, 300.0, 900.0]  # 1 min, 5 min, 15 min
+        self.current_backoff_idx = 0
         self.window = window
         self.failure_timestamps = []
         self.state = "CLOSED"  # CLOSED, OPEN, HALF-OPEN
@@ -27,8 +28,9 @@ class APICircuitBreaker:
         """Returns True if call is allowed, False otherwise"""
         now = time.time()
         if self.state == "OPEN":
-            if now - self.last_state_change > self.reset_timeout:
-                logger.warning("Circuit breaker transitioning to HALF-OPEN")
+            current_timeout = self.backoff_levels[min(self.current_backoff_idx, len(self.backoff_levels) - 1)]
+            if now - self.last_state_change > current_timeout:
+                logger.warning(f"Circuit breaker transitioning to HALF-OPEN after {current_timeout}s timeout")
                 self.state = "HALF-OPEN"
                 self.last_state_change = now
                 return True
@@ -40,6 +42,7 @@ class APICircuitBreaker:
         if self.state != "CLOSED":
             logger.info("Circuit breaker successfully reset to CLOSED")
             self.state = "CLOSED"
+            self.current_backoff_idx = max(0, self.current_backoff_idx - 1) # Reduce backoff level slowly
             self.last_state_change = time.time()
 
     def record_failure(self):
@@ -50,8 +53,10 @@ class APICircuitBreaker:
         
         if len(self.failure_timestamps) >= self.max_failures:
             if self.state != "OPEN":
-                logger.critical(f"APICircuitBreaker: {len(self.failure_timestamps)} failures in {self.window}s. OPENING CIRCUIT!")
+                timeout = self.backoff_levels[min(self.current_backoff_idx, len(self.backoff_levels) - 1)]
+                logger.critical(f"APICircuitBreaker: {len(self.failure_timestamps)} failures in {self.window}s. OPENING CIRCUIT for {timeout}s!")
                 self.state = "OPEN"
+                self.current_backoff_idx += 1  # Escalation!
                 self.last_state_change = now
 
 class ExecutionEngine:
@@ -107,11 +112,12 @@ class ExecutionEngine:
                 logger.error(f"Broker authentication failed: {e}")
                 raise
 
-    def place_order(self, symbol: str, quantity: int, side: str, order_type: str = "MARKET", price: float = 0.0) -> str:
+    def place_order(self, symbol: str, quantity: int, side: str, order_type: str = "MARKET", price: float = 0.0, market_depth: dict = None, prev_close: float = None) -> str:
         """
         Place an order to the broker.
         side: "BUY" or "SELL"
-        order_type: "MARKET" or "LIMIT"
+        order_type: "MARKET", "LIMIT", "TWAP"
+        market_depth: Optional depth info to check circuit limits
         """
         if not self.circuit_breaker.check_call():
             logger.critical("API call blocked by Circuit Breaker (State: OPEN). Switching to monitoring-only.")
@@ -121,6 +127,27 @@ class ExecutionEngine:
             logger.error(f"Invalid quantity {quantity} for {symbol}")
             return ""
             
+        # Circuit Limit Pre-Trade Check
+        if market_depth is not None:
+            if side == "BUY" and market_depth.get("ask_volume", 1) == 0:
+                logger.critical(f"Upper Circuit Hit for {symbol}. Order rejected to protect margin.")
+                return ""
+            if side == "SELL" and market_depth.get("bid_volume", 1) == 0:
+                logger.critical(f"Lower Circuit Hit for {symbol}. Order rejected to protect margin.")
+                return ""
+                
+        # Redundant Velocity Circuit Limit Check (protects against stale L1 depth)
+        if prev_close is not None and price > 0:
+            price_change_pct = abs(price - prev_close) / prev_close
+            if price_change_pct > 0.095:  # 9.5% indicates we are near a standard 10% circuit limit
+                logger.critical(f"Velocity Circuit Limit Pre-Emptive Halt for {symbol}. Price changed {price_change_pct:.2%}. Order blocked.")
+                return ""
+                
+        # Handle institutional large orders via simulated TWAP to minimize market impactfor size. Replace with TWAP.
+        if order_type == "MARKET" and quantity > 500: # Arbitrary large lot threshold
+            logger.warning("Large MARKET order detected. Institutional override applying TWAP routing.")
+            order_type = "TWAP"
+
         logger.info(f"Placing {order_type} {side} order for {quantity} {symbol} @ {price}")
         
         if self.paper_trading:
@@ -164,15 +191,18 @@ class ExecutionEngine:
             'timestamp': datetime.now()
         }
         
-        if order_type == "MARKET":
+        if order_type in ["MARKET", "TWAP"]:
             # Simulate execution price (add slippage)
             exec_price = price
             if price > 0:
-                slippage = self.estimate_slippage(quantity * price, 100000000, side=side) # Mock ADV
+                # TWAP reduces slippage by a factor
+                reduction_factor = 0.3 if order_type == "TWAP" else 1.0
+                slippage = self.estimate_slippage(quantity * price, 100000000, side=side) * reduction_factor
                 exec_price = price + (price * slippage) if side == "BUY" else price - (price * slippage)
             order['average_price'] = exec_price
+            order['status'] = 'COMPLETE' # Fast forward TWAP completion in paper mode
             self._update_position(symbol, quantity, side, exec_price)
-            logger.info(f"Mock MARKET order executed: {side} {quantity} {symbol} @ {exec_price:.2f}")
+            logger.info(f"Mock {order_type} order executed: {side} {quantity} {symbol} @ {exec_price:.2f}")
         else:
             logger.info(f"Mock LIMIT order placed: {side} {quantity} {symbol} @ {price:.2f}")
             

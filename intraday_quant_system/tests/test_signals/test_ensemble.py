@@ -16,16 +16,16 @@ def test_ensemble_scoring():
     scorer = EnsembleScorer()
     
     score = scorer.compute_score(
-        lgbm_prob=0.9,      # * 0.30 = 0.27
-        xgboost_prob=0.5,   # * 0.20 = 0.10 (default)
-        tft_prob=0.5,       # * 0.10 = 0.05 (default)
+        lgbm_prob=0.9,      # Calibrated: ~0.9608 * 0.30 = 0.2882
+        tabnet_prob=0.5,   # Calibrated: ~0.50 * 0.20 = 0.10
+        tft_prob=0.5,       # Calibrated: ~0.50 * 0.10 = 0.05
         meta_prob=0.7,      # * 0.20 = 0.14
         sentiment_score=0.8,# normalized to 0.9 * 0.10 = 0.09
         regime_score=1.0    # * 0.10 = 0.10
     )
-    # expected: 0.27 + 0.10 + 0.05 + 0.14 + 0.09 + 0.10 = 0.75
+    # expected: 0.28825 + 0.10 + 0.05 + 0.14 + 0.09 + 0.10 = 0.76825
     
-    assert abs(score - 0.75) < 0.001
+    assert abs(score - 0.76825) < 0.001
     
     signal = scorer.get_signal(score)
     assert signal == 'buy'

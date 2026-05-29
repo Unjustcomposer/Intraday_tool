@@ -55,16 +55,36 @@ class BacktestEngine:
         
         # Convert to boolean entries/exits for vectorbt
         entries = execution_signals == 1
-        exits = execution_signals == 0  # Close long when signal is 0 or -1
+        exits = execution_signals <= 0      # Close long when signal is 0 (flat) or -1 (short)
         short_entries = execution_signals == -1
-        short_exits = execution_signals == 0 # Close short when signal is 0 or 1
+        short_exits = execution_signals >= 0  # Close short when signal is 0 (flat) or +1 (long)
         
-        # Use open price for execution since signal was generated at previous close
-        execution_price = df['open']
+        # Use VWAP for execution to better model intra-bar execution. Fallback to open if missing.
+        execution_price = df['vwap'] if 'vwap' in df.columns else df['open']
         
         logger.info(f"Running backtest with {self.round_trip_cost:.4%} assumed round-trip costs")
         
         try:
+            # Pre-calculate asymmetric Almgren-Chriss slippage array
+            # ADV is approximated via a rolling 20-period volume.
+            # k=0.1, asymmetry=1.5 for long, 0.8 for short.
+            adv = df['volume'].rolling(window=20, min_periods=1).mean().fillna(1000)
+            order_size = initial_capital / df['close'] # Approximation of share size
+            participation_rate = (order_size / adv).clip(upper=1.0)
+            
+            # Slippage for buys (long entries and short exits)
+            buy_slippage = (0.1 * np.sqrt(participation_rate) * 1.5).clip(upper=0.01)
+            # Slippage for sells (short entries and long exits)
+            sell_slippage = (0.1 * np.sqrt(participation_rate) * 0.8).clip(upper=0.01)
+            
+            # Institutional Upgrade: Adverse Selection (Queue Position) Penalty
+            # Simulates paying the spread crossing + getting filled at the back of the queue
+            queue_penalty = 0.0005 # 5 bps static penalty for queue disadvantage
+            
+            # Since vectorbt takes a single slippage parameter, we use the average, 
+            # combined with the static queue penalty for extreme realism.
+            combined_slippage = ((buy_slippage + sell_slippage) / 2.0) + queue_penalty
+            
             # Build portfolio
             pf = vbt.Portfolio.from_signals(
                 execution_price,
@@ -74,7 +94,7 @@ class BacktestEngine:
                 short_exits=short_exits,
                 init_cash=initial_capital,
                 fees=self.round_trip_cost / 2,  # vbt applies fee per trade leg
-                slippage=self.estimated_slippage,
+                slippage=combined_slippage,
                 freq='5min'  # Assume 5-min bars
             )
             
