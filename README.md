@@ -1,5 +1,3 @@
-<![CDATA[<div align="center">
-
 # ⚡ Institutional-Grade Intraday Quant Trading System
 
 ### NSE / BSE · Indian Equities · Fully Automated
