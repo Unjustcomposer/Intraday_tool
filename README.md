@@ -37,7 +37,7 @@ A production-ready, multi-process quantitative trading pipeline for Indian intra
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        PROCESS A — Data Ingestion                   │
 │  ┌──────────────┐   ┌──────────────┐   ┌─────────────────────────┐  │
-│  │  Kite WebSocket │→│ Bar Aggregator │→│ Redis Pub/Sub (1-min)  │  │
+│  │Kite WebSocket│→  │Bar Aggregator│→  │  Redis Pub/Sub (1-min)  │  │
 │  └──────────────┘   └──────────────┘   └─────────────────────────┘  │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │  Completed bars published
@@ -46,18 +46,18 @@ A production-ready, multi-process quantitative trading pipeline for Indian intra
 │                     PROCESS B — Inference Pipeline                  │
 │                                                                     │
 │  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌───────────┐             │
-│  │ Feature  │→│  Regime   │→│ ML Models │→│ Ensemble  │             │
-│  │  Store   │  │ Detector │  │LGB/CB/TFT│  │  Scorer   │            │ 
+│  │ Feature │→ │ Regime   │→ │ ML Models│→ │ Ensemble  │             │
+│  │  Store  │  │ Detector │  │LGB/CB/TFT│  │  Scorer   │             │ 
 │  └─────────┘  └──────────┘  └──────────┘  └─────┬─────┘             │
 │                                                   │                 │
 │  ┌──────────┐  ┌───────────┐  ┌──────────────────▼──────────────┐   │
-│  │ FinBERT  │→│ Sentiment  │→│    Signal Generation & Gating   │    │
-│  │   NLP    │  │  Features  │  │  (Conformal Prediction Thresh) │   │
+│  │ FinBERT  │→ │ Sentiment │→ │   Signal Generation & Gating    │   │
+│  │   NLP    │  │  Features │  │  (Conformal Prediction Thresh)  │   │
 │  └──────────┘  └───────────┘  └──────────────────┬──────────────┘   │
 │                                                   │                 │
 │  ┌───────────────┐  ┌────────────┐  ┌────────────▼────────────┐     │
-│  │ Position Sizer │→│ Risk Mgmt  │→│   Execution Engine      │      │
-│  │ (Kelly/Vol)    │  │ (DPO/VaR)  │  │ (TWAP + Almgren-Chriss)│     │
+│  │ Position Sizer│→ │ Risk Mgmt  │→ │   Execution Engine      │     │
+│  │ (Kelly/Vol)   │  │ (DPO/VaR)  │  │ (TWAP + Almgren-Chriss) │     │
 │  └───────────────┘  └────────────┘  └─────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
