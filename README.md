@@ -414,4 +414,3 @@ pytest tests/test_integration/    # Pipeline initialization
 **Built with ❤️ for the Indian markets**
 
 </div>
-]]>
