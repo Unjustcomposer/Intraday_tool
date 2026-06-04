@@ -7,6 +7,8 @@ import json
 import os
 from datetime import datetime
 from sklearn.metrics import roc_auc_score, classification_report, brier_score_loss
+from sklearn.isotonic import IsotonicRegression
+from sklearn.model_selection import TimeSeriesSplit
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +40,8 @@ class LGBMAlphaModel:
             'verbose': -1,
         }
         self.early_stopping_rounds = config.get('early_stopping_rounds', 50)
-        self.model = lgb.LGBMClassifier(**self.params)
+        self.base_model = lgb.LGBMClassifier(**self.params)
+        self.calibrator = None
         self.is_fitted = False
         self.train_metrics: dict = {}
         self.version: str = ""
@@ -128,30 +131,27 @@ class LGBMAlphaModel:
                     
         return pd.Series(labels, index=df.index)
 
-    def train(self, X: pd.DataFrame, y: pd.Series, val_size: float = 0.2) -> 'LGBMAlphaModel':
+    def train(self, X: pd.DataFrame, y: pd.Series) -> 'LGBMAlphaModel':
         """
-        Train with proper train/validation split and early stopping.
-        
-        Uses time-based split (last val_size% as validation) to prevent
-        future data leakage — NOT random split.
+        Train using Purged Walk-Forward Cross Validation (TimeSeriesSplit with gap).
+        Prevents lookahead bias and label leakage.
         """
-        logger.info(f"Training LightGBM on {len(X)} samples")
+        logger.info(f"Training LightGBM on {len(X)} samples with Purged CV")
         
-        # Time-based split: use last portion as validation (no shuffling)
-        split_idx = int(len(X) * (1 - val_size))
-        X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
-        y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+        # Walk-forward CV: iterate through folds, using the LAST fold for final training.
+        # The last fold has the largest training set and most recent validation data,
+        # which is the correct choice for walk-forward temporal validation.
+        tscv = TimeSeriesSplit(n_splits=3, gap=15)
+        for train_idx, val_idx in tscv.split(X):
+            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+            
+            pos_rate = y_train.mean()
+            if pos_rate < 0.1 or pos_rate > 0.9:
+                logger.warning(f"Label imbalance in fold: {pos_rate:.1%} positive.")
         
-        logger.info(f"Train: {len(X_train)} samples | Val: {len(X_val)} samples")
-        logger.info(f"Label distribution — Train: {y_train.mean():.3f} | Val: {y_val.mean():.3f}")
-        
-        # Check for label imbalance
-        pos_rate = y_train.mean()
-        if pos_rate < 0.1 or pos_rate > 0.9:
-            logger.warning(f"Severe label imbalance: {pos_rate:.1%} positive. Consider adjusting labeling thresholds.")
-        
-        # Fit with early stopping
-        self.model.fit(
+        # Fit base model with early stopping
+        self.base_model.fit(
             X_train, y_train,
             eval_set=[(X_val, y_val)],
             callbacks=[
@@ -160,13 +160,21 @@ class LGBMAlphaModel:
             ]
         )
         
+        # Apply Platt Scaling (Isotonic Regression) on the validation set
+        logger.info("Calibrating model using isotonic regression on validation set...")
+        
+        # We manually fit the calibrator to avoid the cv='prefit' bug in newer sklearn
+        raw_probs = self.base_model.predict_proba(X_val)[:, 1]
+        self.calibrator = IsotonicRegression(out_of_bounds='clip')
+        self.calibrator.fit(raw_probs, y_val)
+        
         self.is_fitted = True
         self.feature_names = list(X.columns)
         self.version = datetime.now().strftime('%Y%m%d_%H%M%S')
         
         # Compute validation metrics
-        val_probs = self.model.predict_proba(X_val)[:, 1]
-        val_preds = (val_probs > 0.5).astype(int)
+        val_preds = (self.predict_proba(X_val) > 0.5).astype(int)
+        val_probs = self.predict_proba(X_val)
         
         try:
             val_auc = roc_auc_score(y_val, val_probs)
@@ -181,7 +189,7 @@ class LGBMAlphaModel:
         self.train_metrics = {
             'val_auc': float(val_auc),
             'val_brier_score': float(brier),
-            'best_iteration': self.model.best_iteration_ if hasattr(self.model, 'best_iteration_') else -1,
+            'best_iteration': self.base_model.best_iteration_ if hasattr(self.base_model, 'best_iteration_') else -1,
             'n_train': len(X_train),
             'n_val': len(X_val),
             'train_pos_rate': float(pos_rate),
@@ -198,20 +206,21 @@ class LGBMAlphaModel:
         if not self.is_fitted:
             logger.warning("Model not fitted, returning 0.5 probabilities")
             return np.ones(len(X)) * 0.5
-        return self.model.predict_proba(X)[:, 1]
+        raw_probs = self.base_model.predict_proba(X)[:, 1]
+        return self.calibrator.predict(raw_probs)
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         if not self.is_fitted:
             logger.warning("Model not fitted, returning 0 classes")
             return np.zeros(len(X))
-        return self.model.predict(X)
+        return (self.predict_proba(X) > 0.5).astype(int)
 
     def feature_importance(self) -> pd.DataFrame:
         if not self.is_fitted:
             return pd.DataFrame()
             
-        importance = self.model.feature_importances_
-        features = self.model.feature_name_
+        importance = self.base_model.feature_importances_
+        features = self.base_model.feature_name_
         
         df = pd.DataFrame({
             'feature': features,
@@ -221,8 +230,19 @@ class LGBMAlphaModel:
 
     def save(self, path: str):
         """Save model using native LightGBM format (no pickle) with JSON sidecar metadata"""
-        if self.is_fitted:
-            self.model.booster_.save_model(path)
+        if self.is_fitted and hasattr(self, 'base_model') and hasattr(self.base_model, 'booster_'):
+            self.base_model.booster_.save_model(path)
+            
+            # Save calibration parameters if available
+            calibrator_data = {}
+            if self.calibrator:
+                calibrator_data = {
+                    'method': 'isotonic',
+                    'X_min_': float(self.calibrator.X_min_) if hasattr(self.calibrator, 'X_min_') else 0.0,
+                    'X_max_': float(self.calibrator.X_max_) if hasattr(self.calibrator, 'X_max_') else 1.0,
+                    'X_thresholds_': self.calibrator.X_thresholds_.tolist() if hasattr(self.calibrator, 'X_thresholds_') else [],
+                    'y_thresholds_': self.calibrator.y_thresholds_.tolist() if hasattr(self.calibrator, 'y_thresholds_') else []
+                }
             
             # Save metadata alongside
             meta_path = path + '.meta.json'
@@ -232,6 +252,7 @@ class LGBMAlphaModel:
                     'metrics': self.train_metrics,
                     'feature_names': self.feature_names,
                     'params': {k: v for k, v in self.params.items() if not callable(v)},
+                    'calibrator': calibrator_data
                 }, f, indent=2, default=str)
             
             logger.info(f"Saved model v{self.version} to {path}")
@@ -239,9 +260,11 @@ class LGBMAlphaModel:
     def load(self, path: str):
         """Load model using native LightGBM Booster (no pickle)"""
         booster = lgb.Booster(model_file=path)
-        self.model = lgb.LGBMClassifier(**self.params)
-        self.model._Booster = booster
-        self.model._n_classes = 2
+        self.base_model = lgb.LGBMClassifier(**self.params)
+        self.base_model._Booster = booster
+        self.base_model._n_classes = 2
+        # Reconstruct calibrator
+        self.calibrator = IsotonicRegression(out_of_bounds='clip')
         self.is_fitted = True
         
         meta_path = path + '.meta.json'
@@ -251,4 +274,15 @@ class LGBMAlphaModel:
                 self.version = meta.get('version', 'unknown')
                 self.train_metrics = meta.get('metrics', {})
                 self.feature_names = meta.get('feature_names', [])
+                
+                calibrator_state = meta.get('calibrator', {})
+                if calibrator_state:
+                    self.calibrator.X_min_ = calibrator_state.get('X_min_', 0.0)
+                    self.calibrator.X_max_ = calibrator_state.get('X_max_', 1.0)
+                    if calibrator_state.get('X_thresholds_'):
+                        self.calibrator.X_thresholds_ = np.array(calibrator_state['X_thresholds_'])
+                        self.calibrator.y_thresholds_ = np.array(calibrator_state['y_thresholds_'])
+                    else:
+                        self.calibrator.X_thresholds_ = np.array([0.0, 1.0])
+                        self.calibrator.y_thresholds_ = np.array([0.0, 1.0])
             logger.info(f"Loaded model v{self.version}")

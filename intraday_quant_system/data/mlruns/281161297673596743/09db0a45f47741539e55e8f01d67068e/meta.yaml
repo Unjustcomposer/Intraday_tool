@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/09db0a45f47741539e55e8f01d67068e/artifacts
+end_time: 1780259579837
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 09db0a45f47741539e55e8f01d67068e
+run_name: skillful-shrike-3
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780259578512
+status: 4
+tags: []
+user_id: khand

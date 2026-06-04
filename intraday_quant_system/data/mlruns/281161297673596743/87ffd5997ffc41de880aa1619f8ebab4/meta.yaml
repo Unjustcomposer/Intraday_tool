@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/87ffd5997ffc41de880aa1619f8ebab4/artifacts
+end_time: 1780303572815
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 87ffd5997ffc41de880aa1619f8ebab4
+run_name: blushing-owl-657
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780303494981
+status: 3
+tags: []
+user_id: khand

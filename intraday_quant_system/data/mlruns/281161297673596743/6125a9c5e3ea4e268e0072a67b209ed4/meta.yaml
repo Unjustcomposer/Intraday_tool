@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/6125a9c5e3ea4e268e0072a67b209ed4/artifacts
+end_time: 1780260100146
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 6125a9c5e3ea4e268e0072a67b209ed4
+run_name: persistent-fawn-452
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780260010662
+status: 3
+tags: []
+user_id: khand

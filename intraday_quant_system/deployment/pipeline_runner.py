@@ -397,13 +397,14 @@ class PipelineRunner:
                 regime_exposure = self.regime_detector.get_exposure(current_regime)
                 score = self.ensemble_scorer.compute_score(
                     lgbm_prob=lgbm_prob,
-                    xgboost_prob=xgb_prob,
+                    tabnet_prob=xgb_prob,
                     tft_prob=tft_prob,
                     meta_prob=meta_prob,
                     meta_gate=conformal_gate,
                     sentiment_score=sentiment_score,
                     regime_score=regime_exposure,
-                    regime=current_regime
+                    regime=current_regime,
+                    symbol=symbol
                 )
                 
                 # 7. Order routing and execution profiling
@@ -411,7 +412,7 @@ class PipelineRunner:
                 
                 vix = getattr(self.risk_monitor, 'current_vix', 15.0)
                 signal = self.ensemble_scorer.get_signal(
-                    score, regime=current_regime, vix=vix, meta_confidence=meta_prob
+                    score, symbol=symbol, regime=current_regime, vix=vix, meta_confidence=meta_prob
                 )
                 
                 self.log_audit_event("SIGNAL_GENERATED", {
@@ -570,3 +571,12 @@ class PipelineRunner:
             self._inference_pool.shutdown(wait=False)
             self.is_running = False
             logger.info("Pipeline runner stopped.")
+
+if __name__ == "__main__":
+    runner = PipelineRunner()
+    runner.start()
+    try:
+        runner.main_loop()
+    except KeyboardInterrupt:
+        logger.info("Interrupt received. Shutting down...")
+        runner.stop()

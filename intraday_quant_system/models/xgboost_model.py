@@ -1,12 +1,13 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-import joblib
 import logging
+import json
 import os
 from datetime import datetime
 from typing import Dict, Any, Tuple
 from sklearn.isotonic import IsotonicRegression
+from sklearn.model_selection import TimeSeriesSplit
 
 logger = logging.getLogger(__name__)
 
@@ -30,19 +31,21 @@ class XGBoostAlphaModel:
         self.feature_names = None
         self.is_trained = False
         
-    def train(self, X: pd.DataFrame, y: pd.Series, val_size: float = 0.2) -> Dict[str, Any]:
+    def train(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, Any]:
         """
-        Train the XGBoost model using a time-based train/val split.
+        Train the XGBoost model using Purged Time-based split.
         Applies Isotonic Regression for probability calibration.
         """
-        logger.info(f"Training XGBoost model on {len(X)} samples")
+        logger.info(f"Training XGBoost model on {len(X)} samples with Purged CV")
         self.feature_names = list(X.columns)
         
-        # Time-based split (assuming X is ordered chronologically)
-        split_idx = int(len(X) * (1 - val_size))
-        
-        X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
-        y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+        # Walk-forward CV: iterate through folds, using the LAST fold for final training.
+        # The last fold has the largest training set and most recent validation data,
+        # which is the correct choice for walk-forward temporal validation.
+        tscv = TimeSeriesSplit(n_splits=3, gap=15)
+        for train_idx, val_idx in tscv.split(X):
+            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
         
         # XGBoost handles NaNs internally, but warn if there are too many
         missing_pct = X_train.isna().mean().max()
@@ -117,13 +120,22 @@ class XGBoostAlphaModel:
         return df
         
     def save(self, filepath: str):
-        """Save model securely using joblib"""
+        """Save model securely without pickle/joblib"""
         if not self.is_trained:
             raise ValueError("Cannot save untrained model")
             
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        self.model.save_model(filepath + '.json')
+        
+        calibrator_state = {
+            'X_min_': float(self.calibrator.X_min_) if hasattr(self.calibrator, 'X_min_') else 0.0,
+            'X_max_': float(self.calibrator.X_max_) if hasattr(self.calibrator, 'X_max_') else 1.0,
+            'X_thresholds_': self.calibrator.X_thresholds_.tolist() if hasattr(self.calibrator, 'X_thresholds_') else [],
+            'y_thresholds_': self.calibrator.y_thresholds_.tolist() if hasattr(self.calibrator, 'y_thresholds_') else []
+        }
+        
         state = {
-            'model': self.model,
-            'calibrator': self.calibrator,
+            'calibrator': calibrator_state,
             'feature_names': self.feature_names,
             'config': {
                 'max_depth': self.max_depth,
@@ -133,21 +145,36 @@ class XGBoostAlphaModel:
             'timestamp': datetime.now().isoformat()
         }
         
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        joblib.dump(state, filepath)
+        with open(filepath + '.meta.json', 'w') as f:
+            json.dump(state, f)
         logger.info(f"Model saved to {filepath}")
         
     @classmethod
     def load(cls, filepath: str) -> "XGBoostAlphaModel":
         """Load model from file"""
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Model file not found: {filepath}")
+        if not os.path.exists(filepath + '.json') or not os.path.exists(filepath + '.meta.json'):
+            raise FileNotFoundError(f"Model files not found: {filepath}")
             
-        state = joblib.load(filepath)
-        
+        with open(filepath + '.meta.json', 'r') as f:
+            state = json.load(f)
+            
         instance = cls(state.get('config', {}))
-        instance.model = state['model']
-        instance.calibrator = state['calibrator']
+        
+        instance.model = xgb.XGBClassifier()
+        instance.model.load_model(filepath + '.json')
+        
+        calibrator_state = state['calibrator']
+        instance.calibrator = IsotonicRegression(out_of_bounds='clip')
+        instance.calibrator.X_min_ = calibrator_state['X_min_']
+        instance.calibrator.X_max_ = calibrator_state['X_max_']
+        if calibrator_state['X_thresholds_']:
+            instance.calibrator.X_thresholds_ = np.array(calibrator_state['X_thresholds_'])
+            instance.calibrator.y_thresholds_ = np.array(calibrator_state['y_thresholds_'])
+        else:
+            # Fake fitted state for empty thresholds
+            instance.calibrator.X_thresholds_ = np.array([0.0, 1.0])
+            instance.calibrator.y_thresholds_ = np.array([0.0, 1.0])
+        
         instance.feature_names = state['feature_names']
         instance.is_trained = True
         

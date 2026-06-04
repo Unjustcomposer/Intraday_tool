@@ -55,45 +55,31 @@ def sector_rotation_score(sector_returns: pd.DataFrame) -> dict:
         
     return scores
 
-def options_pcr_ratio(df: pd.DataFrame, window: int = 20) -> pd.Series:
-    """Rolling average of Put/Call Ratio (PCR).
-    Requires real NSE Option Chain data — returns NaN when unavailable."""
-    if 'options_pcr' not in df.columns or df['options_pcr'].isna().all():
-        return pd.Series(np.nan, index=df.index)
-    return df['options_pcr'].rolling(window=window).mean()
-
-def options_max_pain_deviation(df: pd.DataFrame) -> pd.Series:
-    """Deviation of current price from options max pain strike.
-    Requires real NSE Option Chain data — returns NaN when unavailable."""
-    if 'close' not in df.columns or 'options_max_pain' not in df.columns:
-        return pd.Series(np.nan, index=df.index)
-    if df['options_max_pain'].isna().all():
-        return pd.Series(np.nan, index=df.index)
-    return (df['close'] - df['options_max_pain']) / df['close']
-
-def options_unusual_oi_signal(df: pd.DataFrame, window: int = 10) -> pd.Series:
-    """Indicator of recent unusual options open interest buildup.
-    Requires real NSE Option Chain data — returns NaN when unavailable."""
-    if 'options_unusual_oi' not in df.columns or df['options_unusual_oi'].isna().all():
-        return pd.Series(np.nan, index=df.index)
-    return df['options_unusual_oi'].rolling(window=window).sum()
-
 def nifty_futures_basis_pct(df: pd.DataFrame) -> pd.Series:
-    """Nifty Futures Basis as % of asset close price.
-    Requires real NSE Futures data — returns NaN when unavailable."""
-    if 'close' not in df.columns or 'nifty_futures_basis' not in df.columns:
-        return pd.Series(np.nan, index=df.index)
-    if df['nifty_futures_basis'].isna().all():
-        return pd.Series(np.nan, index=df.index)
-    return df['nifty_futures_basis'] / df['close']
+    """Nifty Futures Basis proxy (using moving average divergence as a proxy for basis expansion/contraction)."""
+    if 'close' not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    
+    # Proxy: If EMA 10 is sharply above EMA 50, implies contango / positive basis
+    ema_short = df['close'].ewm(span=10, adjust=False).mean()
+    ema_long = df['close'].ewm(span=50, adjust=False).mean()
+    
+    proxy_basis = (ema_short - ema_long) / ema_long
+    return proxy_basis
 
 def fii_dii_net_flow_momentum(df: pd.DataFrame, window: int = 5) -> pd.Series:
-    """Rolling momentum of combined FII and DII daily net flows (Cr INR).
-    Requires real NSDL/CDSL FII/DII data — returns NaN when unavailable."""
-    if 'fii_net_flow' not in df.columns or 'dii_net_flow' not in df.columns:
-        return pd.Series(np.nan, index=df.index)
-    if df['fii_net_flow'].isna().all() or df['dii_net_flow'].isna().all():
-        return pd.Series(np.nan, index=df.index)
-    combined = df['fii_net_flow'] + df['dii_net_flow']
-    return combined.rolling(window=window).mean()
+    """Rolling momentum proxy for institutional flows (uses cumulative volume delta)."""
+    if 'close' not in df.columns or 'volume' not in df.columns:
+        return pd.Series(0.0, index=df.index)
+        
+    # Proxy: Directional volume (close > open -> positive flow)
+    if 'open' in df.columns:
+        flow = np.where(df['close'] > df['open'], df['volume'], -df['volume'])
+    else:
+        flow = df['volume'] * np.sign(df['close'].diff().fillna(0))
+        
+    proxy_flow = pd.Series(flow, index=df.index).rolling(window=window).mean()
+    # Normalize
+    mean_vol = df['volume'].rolling(window=window).mean().replace(0, 1)
+    return proxy_flow / mean_vol
 

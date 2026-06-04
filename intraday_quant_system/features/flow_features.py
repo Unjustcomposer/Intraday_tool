@@ -22,6 +22,33 @@ def relative_volume(df: pd.DataFrame, lookback_days: int = 20) -> pd.Series:
     result = df['volume'] / avg_vol.replace(0, np.nan)
     return result
 
+def order_flow_imbalance(df: pd.DataFrame) -> pd.Series:
+    """
+    Proxy for Order Flow Imbalance (OFI) when L2 tick data is missing.
+    Assigns volume as 'buy' if close > open, 'sell' if close < open.
+    OFI = (BuyVol - SellVol) / TotalVol over a rolling window.
+    """
+    if 'buy_volume' in df.columns and 'sell_volume' in df.columns and df['buy_volume'].notna().any():
+        buy_vol = df['buy_volume'].fillna(0)
+        sell_vol = df['sell_volume'].fillna(0)
+    else:
+        direction = np.sign(df['close'] - df['open'])
+        # If open == close, use previous close comparison
+        prev_direction = np.sign(df['close'] - df['close'].shift(1))
+        direction = np.where(direction == 0, prev_direction, direction)
+        direction = pd.Series(direction, index=df.index).fillna(1)
+        
+        buy_vol = np.where(direction > 0, df['volume'], 0)
+        sell_vol = np.where(direction < 0, df['volume'], 0)
+    
+    # 5-bar rolling sum of OFI
+    roll_buy = pd.Series(buy_vol, index=df.index).rolling(window=5, min_periods=1).sum()
+    roll_sell = pd.Series(sell_vol, index=df.index).rolling(window=5, min_periods=1).sum()
+    roll_tot = pd.Series(df['volume'], index=df.index).rolling(window=5, min_periods=1).sum()
+    
+    ofi = (roll_buy - roll_sell) / roll_tot.replace(0, 1.0)
+    return ofi.fillna(0)
+
 def index_relative_strength(df: pd.DataFrame, index_df: pd.DataFrame = None, window: int = 20) -> pd.Series:
     """Stock returns vs Index returns over a rolling window"""
     if 'close' not in df.columns:

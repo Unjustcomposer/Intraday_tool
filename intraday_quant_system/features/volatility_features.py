@@ -66,7 +66,8 @@ def volatility_percentile(df: pd.DataFrame, lookback_days: int = 60, bars_per_da
             return np.nan
         return pd.Series(x).rank(pct=True).iloc[-1] * 100
         
-    return vol.rolling(window=min(lookback_bars, len(df))).apply(calc_percentile, raw=True)
+    # Use fixed window for stationarity (min_periods prevents NaN for short data)
+    return vol.rolling(window=lookback_bars, min_periods=lookback_bars // 4).apply(calc_percentile, raw=True)
 
 def range_expansion(df: pd.DataFrame) -> pd.Series:
     """(High - Low) / ATR"""

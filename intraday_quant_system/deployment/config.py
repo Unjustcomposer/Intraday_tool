@@ -40,17 +40,12 @@ class TransactionCosts(BaseModel):
         slippage = turnover * self.estimated_slippage_pct
         return brokerage + stt + exchange + gst + sebi + slippage
     
-    def total_round_trip_pct(self) -> float:
-        """Approximate total round-trip cost as percentage"""
-        return (
-            self.brokerage_pct * 2
-            + self.stt_sell_pct
-            + self.exchange_txn_pct * 2
-            + (self.brokerage_pct * 2 + self.exchange_txn_pct * 2) * self.gst_pct
-            + self.sebi_turnover_pct * 2
-            + self.stamp_duty_buy_pct
-            + self.estimated_slippage_pct * 2
-        )
+    def total_round_trip_pct(self, turnover: float = 100000.0) -> float:
+        """Total round-trip cost as percentage for a given turnover.
+        Uses actual ₹20 brokerage cap like the individual cost methods."""
+        buy_cost = self.total_cost_buy(turnover)
+        sell_cost = self.total_cost_sell(turnover)
+        return (buy_cost + sell_cost) / turnover
 
 
 class SuccessMetrics(BaseModel):
@@ -77,29 +72,29 @@ class RiskConfig(BaseModel):
 
 class IntradayTiming(BaseModel):
     """Intraday session parameters for NSE"""
-    bars_per_day: int = 75
-    bars_per_year: int = 18900
+    bars_per_day: int = 72  # 9:15 to 15:15 = 360min / 5min = 72 bars
+    bars_per_year: int = 18144  # 72 * 252
     no_new_trades_after: str = "14:30"
     begin_closing: str = "15:10"
     hard_exit: str = "15:15"
 
 
 class LGBMConfig(BaseModel):
-    num_leaves: int = 63
-    learning_rate: float = 0.03
-    n_estimators: int = 2000
-    early_stopping_rounds: int = 50
-    feature_fraction: float = 0.7
-    bagging_fraction: float = 0.8
-    min_child_samples: int = 100
+    num_leaves: int = 15
+    learning_rate: float = 0.01
+    n_estimators: int = 300
+    early_stopping_rounds: int = 20
+    feature_fraction: float = 0.4
+    bagging_fraction: float = 0.7
+    min_child_samples: int = 50
 
 
 class CatBoostConfig(BaseModel):
-    iterations: int = 800
-    learning_rate: float = 0.05
-    depth: int = 5
-    early_stopping_rounds: int = 50
-    l2_leaf_reg: float = 10.0
+    iterations: int = 300
+    learning_rate: float = 0.02
+    depth: int = 3
+    early_stopping_rounds: int = 20
+    l2_leaf_reg: float = 20.0
 
 
 class TransformerConfig(BaseModel):

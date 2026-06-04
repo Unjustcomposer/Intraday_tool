@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/94f1e64e784d4736b7551870f1abb160/artifacts
+end_time: 1780124790653
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 94f1e64e784d4736b7551870f1abb160
+run_name: treasured-shark-729
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780124785411
+status: 3
+tags: []
+user_id: khand

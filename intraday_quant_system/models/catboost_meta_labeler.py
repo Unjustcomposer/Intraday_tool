@@ -126,12 +126,12 @@ class MetaLabeler:
                 last_fold_train_size = train_end_purged
                 
                 # Conformal Prediction Calibration: Find tau such that precision >= 60%
-                sorted_probs = np.sort(va_probs)
+                sorted_probs = np.sort(va_probs)[::-1]
                 best_tau = 0.50
                 for tau in sorted_probs:
                     preds = (va_probs > tau).astype(int)
                     if preds.sum() == 0:
-                        break
+                        continue
                     precision = y_va[preds == 1].mean()
                     if precision >= 0.60:
                         best_tau = tau
@@ -195,6 +195,7 @@ class MetaLabeler:
         }
         
         logger.info(f"MetaLabeler training complete. Version: {self.version} (used last fold model, no refit)")
+        self.train_metrics = self.metadata  # Sync both attributes
 
     def predict_proba(self, X: pd.DataFrame, primary_preds: np.ndarray = None) -> np.ndarray:
         """Confidence that trade is worth taking"""
@@ -213,7 +214,7 @@ class MetaLabeler:
             self.model.save_model(path)
             meta_path = path + '.meta.json'
             with open(meta_path, 'w') as f:
-                json.dump({'version': self.version, 'conformal_threshold': self.conformal_threshold, 'metrics': self.train_metrics}, f, indent=2, default=str)
+                json.dump({'version': self.version, 'conformal_threshold': self.conformal_threshold, 'metrics': self.metadata}, f, indent=2, default=str)
             
     def load(self, path: str):
         self.model.load_model(path)

@@ -118,7 +118,7 @@ class TickerProcess:
             engine = ExecutionEngine(
                 api_key=self.config.zerodha_api_key,
                 api_secret=self.config.zerodha_api_secret,
-                paper_trading=True  # Safe default: follows configuration setup
+                paper_trading=self.config.paper_trading
             )
             positions = engine.get_positions()
             if not positions.empty:

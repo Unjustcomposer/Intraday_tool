@@ -38,6 +38,7 @@ from signals.ensemble import EnsembleScorer
 from regime.hmm_regime import RegimeDetector
 from backtesting.walk_forward import WalkForwardValidator
 from backtesting.monte_carlo import MonteCarloStressTester
+from backtesting.dsr_metrics import DeflatedSharpeRatio
 from deployment.config import get_config, TransactionCosts
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s: %(message)s', force=True)
@@ -55,7 +56,7 @@ def fetch_data(symbols: list, days: int) -> dict:
     all_data = {}
     for symbol in symbols:
         logger.info(f"Fetching {days} days of data for {symbol}...")
-        df = engine.fetch_historical_data(symbol, start_date, end_date, interval='5minute')
+        df = engine.fetch_historical_data(symbol, start_date, end_date, interval='15minute')
         if not df.empty:
             validation = engine.validate_data(df, symbol)
             logger.info(f"  {symbol}: {len(df)} bars, valid={validation['valid']}, "
@@ -80,7 +81,7 @@ def compute_features_and_labels(symbol: str, df: pd.DataFrame, feature_store: Fe
         features_df['atr'] = compute_atr(features_df)
     
     # Generate labels using triple-barrier method
-    labels = LGBMAlphaModel.make_labels(features_df, atr_mult_up=1.5, atr_mult_down=1.5, horizon_minutes=45)
+    labels = LGBMAlphaModel.make_labels(features_df, atr_mult_up=1.5, atr_mult_down=1.5, horizon_minutes=120)
     features_df['label'] = labels
     
     # Drop rows with NaN features (warmup period)
@@ -117,13 +118,30 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
         
         if len(X_train) < 200 or len(X_val) < 50:
             return _empty_result()
+            
+        # === NEW: Correlation Feature Dropping (fitted strictly on train) ===
+        corr_matrix = X_train.corr().abs()
+        upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        to_drop = [col for col in upper_tri.columns if any(upper_tri[col] > 0.95)]
+        if to_drop:
+            X_train = X_train.drop(columns=to_drop)
+            X_val = X_val.drop(columns=[c for c in to_drop if c in X_val.columns])
+            common_cols = [c for c in common_cols if c not in to_drop]
+            
+        # === NEW: Sequential Train/Meta Split (70/30) ===
+        split_meta = int(len(X_train) * 0.7)
+        X_primary_train = X_train.iloc[:split_meta]
+        y_primary_train = y_train.iloc[:split_meta]
         
-        # 1. Train Alpha Models
+        X_meta_train = X_train.iloc[split_meta:]
+        y_meta_train = y_train.iloc[split_meta:]
+        
+        # 1. Train Alpha Models (on Primary 70%)
         lgbm_model = LGBMAlphaModel(config=config.get('models', {}).get('lgbm', {}))
-        lgbm_model.train(X_train, y_train, val_size=0.15)
+        lgbm_model.train(X_primary_train, y_primary_train, val_size=0.15)
         
         xgb_model = XGBoostAlphaModel()
-        xgb_model.train(X_train, y_train, val_size=0.15)
+        xgb_model.train(X_primary_train, y_primary_train, val_size=0.15)
         
         # Save feature importances to local data/ directory for logging as artifacts
         try:
@@ -143,18 +161,16 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
         tft_model = TemporalFusionTransformerModel()
         seq_len = tft_model.sequence_length
         # Prepare sequences for TFT
-        if len(train_df) > seq_len:
+        if len(X_primary_train) > seq_len:
             try:
-                X_seq_train, y_seq_train, _ = tft_model.prepare_sequences(train_df, common_cols, seq_len=seq_len)
+                train_df_primary = train_df.iloc[:split_meta]
+                X_seq_train, y_seq_train, _ = tft_model.prepare_sequences(train_df_primary, common_cols, seq_len=seq_len)
                 tft_model.train(X_seq_train, y_seq_train, val_size=0.15, epochs=10)
             except Exception as e:
                 logger.warning(f"TFT training failed: {e}")
         
-        # 2. Train MetaLabeler (using primary predictions on a validation slice as proxy)
+        # 2. Train MetaLabeler (using primary predictions on the out-of-sample meta slice)
         meta_labeler = MetaLabeler()
-        split_meta = int(len(X_train) * 0.7)
-        X_meta_train = X_train.iloc[split_meta:]
-        y_meta_train = y_train.iloc[split_meta:]
         lgbm_meta_preds = lgbm_model.predict(X_meta_train)
         
         # Meta-label: 1 if primary prediction was correct, 0 if incorrect
@@ -186,86 +202,146 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
         lgbm_preds = (lgbm_probs > 0.5).astype(int)
         meta_probs = meta_labeler.predict_proba(X_val, primary_preds=lgbm_preds)
         
-        # Simulate trades bar-by-bar (with 1-bar execution delay to eliminate zero-latency assumption)
+        # Simulate trades bar-by-bar (with 1-bar execution delay and queue simulation)
         trades = []
         position = 0
         entry_price = 0.0
         entry_bar = 0
         closes = val_df['close'].values if 'close' in val_df.columns else np.zeros(len(val_df))
         opens = val_df['open'].values if 'open' in val_df.columns else np.zeros(len(val_df))
+        highs = val_df['high'].values if 'high' in val_df.columns else closes
+        lows = val_df['low'].values if 'low' in val_df.columns else closes
+        volumes = val_df['volume'].values if 'volume' in val_df.columns else np.ones(len(val_df)) * 10000
         
-        pending_signal = None  # 'buy' or 'sell' generated on previous bar to execute on current open
-        pending_exit = False   # Exit flag generated on previous bar to execute on current open
+        pending_entry = None  # dict with side, price, queue_pos
+        pending_exit = None   # dict with price, queue_pos
+        atrs = val_df['atr'].values if 'atr' in val_df.columns else np.ones(len(val_df))
+        
+        # Microstructure proxy if spread is not provided
+        spreads = val_df['spread'].values if 'spread' in val_df.columns else (atrs * 0.1)
         
         for i in range(len(X_val)):
             current_open = opens[i]
             current_close = closes[i]
+            current_high = highs[i]
+            current_low = lows[i]
+            current_vol = volumes[i]
+            current_spread = spreads[i]
+            
             if current_open <= 0 or current_close <= 0:
                 continue
                 
-            # 1. Execute pending orders at the OPEN of the candle
+            # 1. Execute pending EXITS
             if pending_exit and position != 0:
-                trade_return = position * (current_open - entry_price) / entry_price
-                trade_return -= round_trip_cost
-                trades.append({
-                    'return': trade_return,
-                    'side': 'long' if position == 1 else 'short',
-                    'duration_bars': i - entry_bar
-                })
-                position = 0
-                entry_price = 0.0
-                pending_exit = False
+                exit_price = pending_exit['price']
+                is_gap = (current_open < exit_price) if position == 1 else (current_open > exit_price)
+                is_cross = (current_low <= exit_price <= current_high)
                 
-            if pending_signal in ('buy', 'sell') and position == 0:
-                position = 1 if pending_signal == 'buy' else -1
-                entry_price = current_open
-                entry_bar = i
-                pending_signal = None
+                if is_gap:
+                    pending_exit['queue_pos'] = 0
+                    fill_price = current_open
+                elif is_cross:
+                    # Reduce queue by 15% of the bar's volume
+                    pending_exit['queue_pos'] -= (current_vol * 0.15)
+                    fill_price = exit_price
+                    
+                if pending_exit['queue_pos'] <= 0 or is_gap:
+                    # Dynamic Tiered Slippage: Spread/2 represents expected slippage cost to cross the book
+                    dynamic_slippage = (current_spread / 2) / fill_price
+                    trade_return = position * (fill_price - entry_price) / entry_price
+                    trade_return -= (dynamic_slippage + round_trip_cost)
+                    trades.append({
+                        'return': trade_return,
+                        'side': 'long' if position == 1 else 'short',
+                        'duration_bars': i - entry_bar
+                    })
+                    position = 0
+                    entry_price = 0.0
+                    pending_exit = None
+                
+            # 1.5 Execute pending ENTRIES
+            if pending_entry and position == 0:
+                entry_target = pending_entry['price']
+                # For long, we want to buy at limit (price must drop to or below limit)
+                if pending_entry['side'] == 'buy':
+                    is_gap = current_open < entry_target
+                    is_cross = current_low <= entry_target <= current_high
+                else:
+                    is_gap = current_open > entry_target
+                    is_cross = current_low <= entry_target <= current_high
+                    
+                if is_gap:
+                    pending_entry['queue_pos'] = 0
+                    fill_price = current_open
+                elif is_cross:
+                    pending_entry['queue_pos'] -= (current_vol * 0.15)
+                    fill_price = entry_target
+                    
+                if pending_entry['queue_pos'] <= 0 or is_gap:
+                    position = 1 if pending_entry['side'] == 'buy' else -1
+                    entry_price = fill_price
+                    entry_bar = i
+                    pending_entry = None
                 
             # 2. Compute signal at the CLOSE of the candle
             regime = regime_series.iloc[i] if i < len(regime_series) else 'unknown'
             
             score = ensemble.compute_score(
                 lgbm_prob=lgbm_probs[i],
-                xgboost_prob=xgb_probs[i],
+                tabnet_prob=xgb_probs[i],
                 tft_prob=tft_probs[i],
                 meta_prob=meta_probs[i],
                 sentiment_score=0.0,
-                regime_score=0.5
+                regime_score=0.5,
+                symbol=symbol
             )
-            signal = ensemble.get_signal(score, regime=regime)
+            current_vix = val_df['realized_vol'].iloc[i] * 100 if 'realized_vol' in val_df.columns else 15.0
+            signal = ensemble.get_signal(score, symbol=symbol, regime=regime, vix=current_vix, meta_confidence=meta_probs[i])
             
             # Check exit/entry conditions for the next bar's open
             if position != 0:
                 exit_now = False
+                current_atr = atrs[i]
+                
+                # Take-Profit logic (1.5x ATR)
+                unrealized_pnl = position * (current_close - entry_price)
+                if unrealized_pnl > (1.5 * current_atr):
+                    exit_now = True
+                    
+                # Dynamic Stop-Loss logic (Scales with spread to prevent whipsaw in illiquid names)
+                dynamic_sl = max(1.0 * current_atr, current_spread * 2)
+                if unrealized_pnl < (-1.0 * dynamic_sl):
+                    exit_now = True
+                
                 # Exit if opposing signal
                 if (position == 1 and signal == 'sell') or (position == -1 and signal == 'buy'):
                     exit_now = True
                     pending_signal = signal  # Queue the reverse entry
-                # Exit if held too long (max 45 bars = 3.75 hours)
-                elif i - entry_bar >= 45:
+                # Exit if held too long (max 168 bars = 1 week on 1H)
+                elif i - entry_bar >= 168:
                     exit_now = True
-                
-                # EOD Exit (15:10 or later)
-                current_time = val_df.index[i]
-                if hasattr(current_time, 'hour') and current_time.hour == 15 and current_time.minute >= 10:
-                    exit_now = True
-                    pending_signal = None
                     
-                if exit_now:
-                    pending_exit = True
+                if exit_now and not pending_exit:
+                    pending_exit = {
+                        'price': current_close,
+                        'queue_pos': current_vol * 0.1 # Queue is 10% of current bar vol
+                    }
             else:
-                current_time = val_df.index[i]
-                if hasattr(current_time, 'hour') and current_time.hour == 15 and current_time.minute >= 10:
-                    signal = 'no_trade'
-                    
-                if signal in ('buy', 'sell'):
-                    pending_signal = signal
+                if signal in ('buy', 'sell') and not pending_entry:
+                    pending_entry = {
+                        'side': signal,
+                        'price': current_close,
+                        'queue_pos': current_vol * 0.1
+                    }
         
         # Close any open position at end of validation (at the last close price)
         if position != 0 and len(closes) > 0:
-            trade_return = position * (closes[-1] - entry_price) / entry_price
-            trade_return -= round_trip_cost
+            final_price = closes[-1]
+            final_spread = spreads[-1]
+            dynamic_slippage = (final_spread / 2) / final_price
+            
+            trade_return = position * (final_price - entry_price) / entry_price
+            trade_return -= (dynamic_slippage + round_trip_cost)
             trades.append({
                 'return': trade_return,
                 'side': 'long' if position == 1 else 'short',
@@ -277,11 +353,11 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
     
     # Run walk-forward with purge + embargo
     wf = WalkForwardValidator(
-        training_window=20,   # Reduced from 35 to 20 to guarantee splits within 40 trading days
-        validation_window=5,  # Reduced from 10 to 5
+        training_window=20,
+        validation_window=5,
         step_size=5,
-        purge_bars=10,
-        embargo_bars=10       # NEW: embargo at start of validation
+        purge_bars=24,
+        embargo_bars=24
     )
     
     results = wf.run(df, train_and_evaluate)
@@ -332,13 +408,13 @@ def _compute_metrics(trades: list, model, y_val, probs) -> dict:
     if np.std(returns) > 0 and len(returns) >= 30:
         # Estimate trades per year from actual duration
         avg_duration_bars = np.mean(durations) if len(durations) > 0 else 10
-        trades_per_day = 75.0 / max(avg_duration_bars, 1)  # 75 bars per day
-        trades_per_year = trades_per_day * 252
+        trades_per_day = 24.0 / max(avg_duration_bars, 1)  # 24 bars per day
+        trades_per_year = trades_per_day * 365 # Crypto 365 days
         sharpe = np.mean(returns) / np.std(returns) * np.sqrt(trades_per_year)
     elif np.std(returns) > 0:
         # Compute but flag as unreliable
         avg_duration_bars = np.mean(durations) if len(durations) > 0 else 10
-        trades_per_year = (75.0 / max(avg_duration_bars, 1)) * 252
+        trades_per_year = (24.0 / max(avg_duration_bars, 1)) * 365
         sharpe = np.mean(returns) / np.std(returns) * np.sqrt(trades_per_year)
         logger.warning(f"Sharpe computed from only {len(returns)} trades (<30) — NOT statistically significant")
     else:
@@ -357,7 +433,7 @@ def _compute_metrics(trades: list, model, y_val, probs) -> dict:
     downside_dev = np.sqrt(np.mean(downside ** 2))
     if downside_dev > 0:
         avg_duration_bars = np.mean(durations) if len(durations) > 0 else 10
-        trades_per_year = (75.0 / max(avg_duration_bars, 1)) * 252
+        trades_per_year = (24.0 / max(avg_duration_bars, 1)) * 365
         sortino = np.mean(returns - mar) / downside_dev * np.sqrt(trades_per_year)
     else:
         sortino = sharpe
@@ -436,6 +512,15 @@ def generate_report(wf_results: dict, mc_results: dict, config) -> dict:
             'pass': avg_profit_factor > 1.0
         },
     }
+    
+    # Add Deflated Sharpe Ratio check
+    if 'dsr' in wf_results:
+        dsr_val = wf_results['dsr']
+        checks['deflated_sharpe_ratio'] = {
+            'value': dsr_val,
+            'threshold': 0.95, # 95% confidence alpha is > 0
+            'pass': dsr_val >= 0.95
+        }
     
     if mc_results:
         checks['ruin_probability'] = {
@@ -563,14 +648,26 @@ def main():
             if os.path.exists(xgb_imp_file):
                 mlflow.log_artifact(xgb_imp_file)
         
-        # 4. Monte Carlo stress test
+        # 4. Monte Carlo stress test & DSR Calculation
         logger.info(f"\n{'='*50}")
-        logger.info("Monte Carlo Stress Test (5,000 simulations)")
+        logger.info("Monte Carlo Stress Test & Statistical Validation")
         logger.info(f"{'='*50}")
         
         mc_results = {}
+        dsr_prob = 0.0
         if all_trade_returns:
-            mc_results = run_monte_carlo(np.array(all_trade_returns), config.max_capital)
+            trades_arr = np.array(all_trade_returns)
+            mc_results = run_monte_carlo(trades_arr, config.max_capital)
+            
+            # Assume ~10,000 independent trials given hyperparameter search space across 4 models
+            # and feature selection. We estimate variance of SRs conservatively as 0.5.
+            trades_per_year = (24.0 / 10) * 365 # Approximation
+            dsr_prob = DeflatedSharpeRatio.calculate_dsr(
+                returns=trades_arr, 
+                n_trials=10000, 
+                variance_of_sharpes=0.5, 
+                annualization_factor=trades_per_year
+            )
         
         # 5. Generate report
         combined_agg = {}
@@ -591,7 +688,7 @@ def main():
                 pass
                 
         report = generate_report(
-            {'aggregated': avg_agg},
+            {'aggregated': avg_agg, 'dsr': dsr_prob},
             mc_results,
             config
         )

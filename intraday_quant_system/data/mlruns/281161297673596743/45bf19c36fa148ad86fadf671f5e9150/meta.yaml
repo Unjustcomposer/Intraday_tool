@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/45bf19c36fa148ad86fadf671f5e9150/artifacts
+end_time: 1780259826799
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 45bf19c36fa148ad86fadf671f5e9150
+run_name: auspicious-elk-930
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780259825596
+status: 3
+tags: []
+user_id: khand

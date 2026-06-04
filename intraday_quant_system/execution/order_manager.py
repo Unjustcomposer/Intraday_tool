@@ -4,6 +4,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from risk.position_sizing import kelly_fraction, volatility_adjusted_size, PortfolioLimits
 from .algorithms import TWAP, VWAP, AlmgrenChriss, Iceberg
+from .volume_profiler import VolumeProfiler
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +44,20 @@ class OrderManager:
         # Track last trade time per symbol to prevent wash trade whipsawing
         self.last_trade_time: Dict[str, datetime] = {}
         
-        # Track open orders for 30s conversion logic
-        self.open_orders: Dict[str, Dict] = {} # order_id -> {symbol, timestamp, ...}
+        # The Order Blotter (Parent Orders)
+        self.blotter: Dict[str, Dict] = {} # order_id -> ParentOrder details
+        
+        # Track open Child orders for 30s conversion logic
+        self.open_orders: Dict[str, Dict] = {} # child_order_id -> {symbol, timestamp, ...}
         
         # Track active execution algorithms
-        self.active_algorithms: Dict[str, Dict] = {} # symbol -> {algo, price, regime, ...}
+        self.active_algorithms: Dict[str, Dict] = {} # algo_id -> {algo, symbol, price, regime, ...}
+        
+        # Cache for historical volume profiles
+        self.volume_profiles_cache: Dict[str, List[float]] = {}
+        
+        import threading
+        self._lock = threading.RLock()
 
     def process_signals(self, signals_df: pd.DataFrame, current_prices: Dict[str, float],
                         market_data: pd.DataFrame = None, features_data: Dict[str, pd.Series] = None):
@@ -132,26 +142,54 @@ class OrderManager:
                     logger.info(f"Position sizing returned 0 for {symbol}. Skipping.")
                     continue
                 
-                LARGE_ORDER_THRESHOLD = 5000
+                # ADV check triggers OMS algorithmic routing (> 0.1% of ADV)
+                # For a typical NSE stock trading 5M shares, > 5,000 shares will trigger VWAP.
+                LARGE_ORDER_THRESHOLD = 5000 
+                
+                # Create Parent Order in Blotter
+                parent_order_id = f"PARENT_{symbol}_{int(now.timestamp())}"
+                self.blotter[parent_order_id] = {
+                    'symbol': symbol,
+                    'side': side,
+                    'quantity': quantity,
+                    'price': price,
+                    'status': 'ACTIVE',
+                    'timestamp': now
+                }
+                
                 if quantity >= LARGE_ORDER_THRESHOLD:
-                    logger.info(f"Large order of {quantity} for {symbol}. Routing via Algorithmic Execution.")
-                    end_time = now + timedelta(minutes=30)
-                    algo = TWAP(symbol, quantity, side, now, end_time, slices=10)
-                    self.active_algorithms[symbol] = {
+                    logger.info(f"[{parent_order_id}] Large order of {quantity} for {symbol}. Routing via Algorithmic Execution (VWAP).")
+                    
+                    # End time typically EOD or +60 mins depending on aggression
+                    end_time = now + timedelta(minutes=60)
+                    
+                    # Get Volume Profile
+                    vol_profile = self.volume_profiles_cache.get(symbol)
+                    if not vol_profile and market_data is not None and not market_data.empty:
+                        sym_data = market_data[market_data['symbol'] == symbol]
+                        vol_profile = VolumeProfiler.compute_intraday_profile(sym_data)
+                        self.volume_profiles_cache[symbol] = vol_profile
+                    
+                    algo = VWAP(symbol, quantity, side, now, end_time, volume_profile=vol_profile)
+                    self.active_algorithms[parent_order_id] = {
                         'algo': algo,
                         'price': price,
                         'regime': regime,
-                        'vol_val': vol_val
+                        'vol_val': vol_val,
+                        'symbol': symbol
                     }
+                    
+                    # Generate first child slice immediately
                     slice_qty = algo.get_next_slice(now)
                     if slice_qty <= 0:
                         continue
                     current_qty = slice_qty
-                    logger.info(f"Executing ALGO slice {side} for {current_qty} shares of {symbol}")
+                    logger.info(f"[{parent_order_id}] Executing Child VWAP slice {side} for {current_qty} shares of {symbol}")
                 else:
                     current_qty = quantity
-                    logger.info(f"Executing {side} for {current_qty} shares of {symbol} "
+                    logger.info(f"[{parent_order_id}] Executing Direct {side} for {current_qty} shares of {symbol} "
                                f"(vol={vol_val:.2f}, regime={regime}, conf={confidence:.2f})")
+                
                 
                 order_id = self.exec_engine.place_order(
                     symbol=symbol,
@@ -181,17 +219,18 @@ class OrderManager:
                                     queue_pos = float(sym_data['ask_volume'].iloc[-1])
                                 
                     # Track for timeouts and queue position estimation
-                    self.open_orders[order_id] = {
-                        'symbol': symbol,
-                        'timestamp': now,
-                        'side': side,
-                        'regime': regime,
-                        'qty': current_qty,
-                        'price': price,
-                        'queue_pos': queue_pos,
-                        'initial_queue_pos': queue_pos,
-                        'oib': oib
-                    }
+                    with self._lock:
+                        self.open_orders[order_id] = {
+                            'symbol': symbol,
+                            'timestamp': now,
+                            'side': side,
+                            'regime': regime,
+                            'qty': current_qty,
+                            'price': price,
+                            'queue_pos': queue_pos,
+                            'initial_queue_pos': queue_pos,
+                            'oib': oib
+                        }
                     
                     # Set initial stop loss using real volatility
                     initial_stop = self.stop_engine.calculate_stop(
@@ -358,7 +397,10 @@ class OrderManager:
         now = datetime.now()
         
         # 1. Handle pending LIMIT order timeouts and queue position deterioration
-        for order_id, info in list(self.open_orders.items()):
+        with self._lock:
+            orders_snapshot = list(self.open_orders.items())
+            
+        for order_id, info in orders_snapshot:
             symbol = info['symbol']
             if symbol not in current_prices:
                 continue
@@ -386,17 +428,20 @@ class OrderManager:
                     price=new_price
                 )
                 if new_order_id:
-                    self.open_orders[new_order_id] = {
-                        'symbol': symbol,
-                        'timestamp': now,
-                        'side': info['side'],
-                        'regime': info['regime'],
-                        'qty': info['qty'],
-                        'price': new_price,
-                        'queue_pos': info.get('initial_queue_pos', 1000.0) * 0.8,
-                        'initial_queue_pos': info.get('initial_queue_pos', 1000.0)
-                    }
-                del self.open_orders[order_id]
+                    with self._lock:
+                        self.open_orders[new_order_id] = {
+                            'symbol': symbol,
+                            'timestamp': now,
+                            'side': info['side'],
+                            'regime': info['regime'],
+                            'qty': info['qty'],
+                            'price': new_price,
+                            'queue_pos': info.get('initial_queue_pos', 1000.0) * 0.8,
+                            'initial_queue_pos': info.get('initial_queue_pos', 1000.0)
+                        }
+                with self._lock:
+                    if order_id in self.open_orders:
+                        del self.open_orders[order_id]
                 continue
                 
             if elapsed > 30:
@@ -415,15 +460,18 @@ class OrderManager:
                     'regime': regime,
                     'volatility': vol_val
                 }
-                del self.open_orders[order_id]
+                with self._lock:
+                    if order_id in self.open_orders:
+                        del self.open_orders[order_id]
                 
         # 1.5 Handle active algorithms (slice generation)
-        for symbol, algo_info in list(self.active_algorithms.items()):
+        for parent_id, algo_info in list(self.active_algorithms.items()):
             algo = algo_info['algo']
+            symbol = algo_info['symbol']
             slice_qty = algo.get_next_slice(now)
             if slice_qty > 0 and symbol in current_prices:
                 price = current_prices[symbol]
-                logger.info(f"Executing ALGO slice {algo.side} for {slice_qty} shares of {symbol}")
+                logger.info(f"[{parent_id}] Executing Child ALGO slice {algo.side} for {slice_qty} shares of {symbol}")
                 order_id = self.exec_engine.place_order(
                     symbol=symbol,
                     quantity=slice_qty,
@@ -432,20 +480,23 @@ class OrderManager:
                     price=price
                 )
                 if order_id:
-                    self.open_orders[order_id] = {
-                        'symbol': symbol,
-                        'timestamp': now,
-                        'side': algo.side,
-                        'regime': algo_info['regime'],
-                        'qty': slice_qty,
-                        'price': price,
-                        'queue_pos': 1000.0,
-                        'initial_queue_pos': 1000.0,
-                        'oib': 0.0
-                    }
+                    with self._lock:
+                        self.open_orders[order_id] = {
+                            'symbol': symbol,
+                            'timestamp': now,
+                            'side': algo.side,
+                            'regime': algo_info['regime'],
+                            'qty': slice_qty,
+                            'price': price,
+                            'queue_pos': 1000.0,
+                            'initial_queue_pos': 1000.0,
+                            'oib': 0.0
+                        }
             if not algo.is_active:
-                logger.info(f"Algorithm finished for {symbol}")
-                del self.active_algorithms[symbol]
+                logger.info(f"[{parent_id}] Algorithm finished executing full Parent Order for {symbol}")
+                if parent_id in self.blotter:
+                    self.blotter[parent_id]['status'] = 'FILLED'
+                del self.active_algorithms[parent_id]
 
         if self.check_hard_exit():
             self.liquidate_all(current_prices)

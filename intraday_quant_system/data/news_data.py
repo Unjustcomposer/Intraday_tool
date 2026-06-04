@@ -1,6 +1,6 @@
 import logging
 from typing import List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import feedparser
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,8 @@ class NewsFetcher:
         """
         logger.info(f"Fetching news from {len(self.feeds)} feeds")
         articles = []
-        cutoff = datetime.now() - timedelta(hours=hours_back)
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(hours=hours_back)
         symbols_lower = [s.lower() for s in (symbols or [])]
         
         for feed_url in self.feeds:
@@ -51,11 +52,11 @@ class NewsFetcher:
                     pub_time = None
                     if hasattr(entry, 'published_parsed') and entry.published_parsed:
                         try:
-                            pub_time = datetime(*entry.published_parsed[:6])
+                            pub_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
                         except (TypeError, ValueError):
-                            pub_time = datetime.now()
+                            pub_time = now_utc
                     else:
-                        pub_time = datetime.now()
+                        pub_time = now_utc
                     
                     # Skip old articles
                     if pub_time < cutoff:

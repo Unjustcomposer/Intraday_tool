@@ -5,8 +5,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import yfinance as yf
-# In a real environment, we would use:
-# from kiteconnect import KiteConnect
+from .broker_interface import BrokerClient
 
 logger = logging.getLogger(__name__)
 
@@ -21,47 +20,17 @@ class MarketDataEngine:
       - Orderbook data (bid/ask) is marked NaN when not available from source
       - Data validation checks for gaps, stale quotes, and anomalies
     """
-    def __init__(self, api_key: str = "", api_secret: str = ""):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.kite = None  # KiteConnect(api_key=self.api_key) if api_key else None
-        self._instruments_cache = None
+    def __init__(self, broker_client: Optional[BrokerClient] = None):
+        self.broker_client = broker_client
 
-    def get_instrument_tokens(self, symbols: List[str], exchange: str = 'NSE') -> dict:
-        """
-        Fetch instrument tokens for a list of symbols dynamically.
-        """
-        if not self.kite:
-            # Mock mapping for simulation if no API key
-            mock_map = {
-                "RELIANCE": 738561,
-                "HDFCBANK": 341249,
-                "TCS": 2953217,
-                "INFY": 408065,
-                "ICICIBANK": 1270529,
-                "SBIN": 779521,
-                "TATAMOTORS": 884737,
-                "WIPRO": 969473
-            }
-            return {sym: mock_map.get(sym) for sym in symbols if sym in mock_map}
-            
-        try:
-            if self._instruments_cache is None:
-                self._instruments_cache = pd.DataFrame(self.kite.instruments(exchange))
-            
-            df = self._instruments_cache
-            subset = df[df['tradingsymbol'].isin(symbols)]
-            return dict(zip(subset['tradingsymbol'], subset['instrument_token']))
-        except Exception as e:
-            logger.error(f"Failed to fetch instrument tokens: {e}")
-            return {}
-        
-    def authenticate(self, request_token: str = ""):
-        """Authenticate with the Kite API"""
-        if self.kite:
-            # data = self.kite.generate_session(request_token, api_secret=self.api_secret)
-            # self.kite.set_access_token(data["access_token"])
-            logger.info("Authenticated with Kite API")
+    def authenticate(self):
+        """Authenticate with the broker API"""
+        if self.broker_client:
+            if self.broker_client.authenticate():
+                logger.info("Authenticated with Broker API")
+            else:
+                logger.warning("Broker API authentication failed. Falling back to yfinance.")
+                self.broker_client = None
         else:
             logger.info("Using yfinance fallback for market data")
 
@@ -158,119 +127,223 @@ class MarketDataEngine:
             'anomaly_count': int(anomalies)
         }
 
-    def fetch_historical_data(self, symbol: str, start_date: datetime, end_date: datetime, interval: str = '5minute') -> pd.DataFrame:
+    def fetch_intraday_data(self, symbol: str, start_date: datetime, end_date: datetime, 
+                            interval: str = '15minute', token: int = None) -> pd.DataFrame:
         """
-        Fetch historical data.
-        Returns DataFrame with columns:
-        [symbol, open, high, low, close, volume, vwap]
-        
-        Orderbook columns (bid/ask) are set to NaN when not available from the data source.
-        They will be populated when using Kite API with Level 2 data.
+        Main interface to get intraday data.
+        Falls back to yfinance if broker API is unavailable.
         """
-        logger.info(f"Fetching {interval} data for {symbol} from {start_date} to {end_date}")
+        if self.broker_client:
+            logger.info(f"Fetching {interval} data for {symbol} from {start_date} to {end_date} via Broker")
+            # Map interval names if needed (assuming broker handles standard strings like '15m' or '15minute')
+            tf = '15m' if '15' in interval else ('5m' if '5' in interval else '1m')
+            try:
+                df = self.broker_client.get_historical_data(symbol, tf, start_date, end_date)
+                if not df.empty:
+                    df['timestamp'] = df.index
+                    df = self._compute_metrics(df)
+                    return df
+            except Exception as e:
+                logger.error(f"Broker fetch failed for {symbol}: {e}. Falling back to yfinance.")
+                
+        # Fallback to yfinance
+        logger.info(f"Fetching {interval} data for {symbol} from {start_date} to {end_date} via yfinance")
+        return self.fetch_nse_data(symbol, start_date, end_date, interval)
+
+    def fetch_nse_data(self, symbol: str, start_date: datetime, end_date: datetime, interval: str = '15minute') -> pd.DataFrame:
+        """
+        Fetch historical data for NSE stocks via yfinance.
+        Synthesizes buy/sell volume using tick-rule heuristic.
+        """
+        logger.info(f"Fetching {interval} data for {symbol} from {start_date} to {end_date} via yfinance")
         
-        # Mapping for yfinance
         yf_interval_map = {
             'minute': '1m',
             '5minute': '5m',
             '15minute': '15m',
+            '1hour': '1h',
             'day': '1d'
         }
-        yf_interval = yf_interval_map.get(interval, '5m')
+        yf_interval = yf_interval_map.get(interval, '15m')
         
-        # yfinance expects .NS for NSE
-        yf_symbol = symbol if symbol.endswith('.NS') else f"{symbol}.NS"
-        
+        # yfinance limits: 1m = 7 days, 5m/15m = 60 days, 1h = 730 days
         try:
-            ticker = yf.Ticker(yf_symbol)
-            df = ticker.history(
-                start=start_date.strftime('%Y-%m-%d'),
-                end=(end_date + timedelta(days=1)).strftime('%Y-%m-%d'),
-                interval=yf_interval
-            )
-            
-            if df.empty:
-                logger.warning(f"No data found for {symbol}")
-                return pd.DataFrame()
-            
-            # Reset index to make Date/Datetime a column
-            df = df.reset_index()
-            if 'Datetime' in df.columns:
-                df = df.rename(columns={'Datetime': 'timestamp'})
-            elif 'Date' in df.columns:
-                df = df.rename(columns={'Date': 'timestamp'})
-            
-            df.columns = [c.lower() for c in df.columns]
-            df['symbol'] = symbol
-            
-            # Validate required columns
-            required_cols = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume']
-            for col in required_cols:
-                if col not in df.columns:
-                    raise ValueError(f"Missing required column {col}")
-            
-            # Remove dividend and stock split columns if present (yfinance artifacts)
-            for drop_col in ['dividends', 'stock splits', 'capital gains']:
-                if drop_col in df.columns:
-                    df = df.drop(columns=[drop_col])
-            
-            # Compute proper daily-reset VWAP
-            df = df.set_index('timestamp')
-            df['vwap'] = self._compute_daily_vwap(df)
-            df = df.reset_index()
-            
-            # Orderbook columns — NaN when not available from data source
-            # These will be populated when using Kite API with Level 2 market depth
-            orderbook_cols = ['bid_price', 'ask_price', 'bid_volume', 'ask_volume',
-                              'oi', 'spread', 'trade_count', 'aggressor_side']
-            for col in orderbook_cols:
-                if col not in df.columns:
-                    df[col] = np.nan
-            
-            # Compute spread from bid/ask if both available
-            bid_ask_available = df['bid_price'].notna() & df['ask_price'].notna()
-            if bid_ask_available.any():
-                df.loc[bid_ask_available, 'spread'] = (
-                    (df.loc[bid_ask_available, 'ask_price'] - df.loc[bid_ask_available, 'bid_price'])
-                    / df.loc[bid_ask_available, 'close']
-                )
-            
-            # Options Flow and Cross-Asset columns
-            # NOTE: These require REAL data sources (NSE Option Chain API, FII/DII data from NSDL).
-            # Set to NaN to honestly represent missing data. Models should NOT train on these
-            # until real data connectors are implemented.
-            # Previous implementation used np.random.seed(42) to generate fake data,
-            # which caused models to learn noise patterns as their top features.
-            df['options_pcr'] = np.nan
-            df['options_max_pain'] = np.nan
-            df['options_unusual_oi'] = np.nan
-            df['nifty_futures_basis'] = np.nan
-            df['fii_net_flow'] = np.nan
-            df['dii_net_flow'] = np.nan
-            
-            # Reorder columns
-            cols = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'vwap',
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(start=start_date.strftime('%Y-%m-%d'), 
+                              end=end_date.strftime('%Y-%m-%d'),
+                              interval=yf_interval)
+        except Exception as e:
+            logger.error(f"yfinance fetch failed for {symbol}: {e}")
+            return pd.DataFrame()
+        
+        if df.empty:
+            logger.warning(f"No data returned for {symbol} from yfinance")
+            return pd.DataFrame()
+        
+        # Normalize column names
+        df = df.rename(columns={
+            'Open': 'open', 'High': 'high', 'Low': 'low',
+            'Close': 'close', 'Volume': 'volume'
+        })
+        
+        # Reset index to get timestamp as column
+        df = df.reset_index()
+        if 'Datetime' in df.columns:
+            df = df.rename(columns={'Datetime': 'timestamp'})
+        elif 'Date' in df.columns:
+            df = df.rename(columns={'Date': 'timestamp'})
+        
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        # Remove timezone info if present (yfinance returns tz-aware)
+        if df['timestamp'].dt.tz is not None:
+            df['timestamp'] = df['timestamp'].dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+        
+        df['symbol'] = symbol
+        
+        # Compute VWAP
+        df = df.set_index('timestamp')
+        df['vwap'] = self._compute_daily_vwap(df)
+        df = df.reset_index()
+        
+        # Synthesize buy/sell volume using tick-rule (close vs open direction)
+        direction = np.sign(df['close'] - df['open'])
+        prev_direction = np.sign(df['close'] - df['close'].shift(1))
+        direction = np.where(direction == 0, prev_direction, direction)
+        direction = pd.Series(direction, index=df.index).fillna(1)
+        
+        df['buy_volume'] = np.where(direction > 0, df['volume'] * 0.6, df['volume'] * 0.4)
+        df['sell_volume'] = df['volume'] - df['buy_volume']
+        df['bid_volume'] = df['buy_volume']
+        df['ask_volume'] = df['sell_volume']
+        
+        # Add empty columns for schema compatibility
+        empty_cols = ['bid_price', 'ask_price', 'oi', 'spread', 'aggressor_side',
+                      'trade_count',
+                      'options_pcr', 'options_max_pain', 'options_unusual_oi',
+                      'nifty_futures_basis', 'fii_net_flow', 'dii_net_flow']
+        for c in empty_cols:
+            df[c] = np.nan
+        
+        # Reorder to internal schema
+        out_cols = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'vwap',
                     'bid_price', 'ask_price', 'bid_volume', 'ask_volume', 'oi', 'spread',
-                    'trade_count', 'aggressor_side',
+                    'trade_count', 'aggressor_side', 'buy_volume', 'sell_volume',
                     'options_pcr', 'options_max_pain', 'options_unusual_oi',
                     'nifty_futures_basis', 'fii_net_flow', 'dii_net_flow']
-            
-            for c in cols:
-                if c not in df.columns:
-                    df[c] = np.nan
-                    
-            df = df[cols]
-            
-            # Run data validation
-            validation = self.validate_data(df, symbol)
-            if not validation['valid']:
-                logger.warning(f"Data quality issues for {symbol}: {validation['issues']}")
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error fetching data for {symbol}: {e}")
+        
+        for c in out_cols:
+            if c not in df.columns:
+                df[c] = np.nan
+        
+        # Drop any extra columns from yfinance (Dividends, Stock Splits, etc.)
+        df = df[out_cols]
+        
+        logger.info(f"Loaded {len(df)} bars for {symbol} via yfinance")
+        return df
+
+    def fetch_historical_data(self, symbol: str, start_date: datetime, end_date: datetime, interval: str = '5minute') -> pd.DataFrame:
+        """
+        Fetch historical data. Routes to yfinance for NSE (.NS) symbols,
+        Binance for crypto symbols (e.g. BTCUSDT).
+        """
+        # Route NSE symbols to yfinance
+        if symbol.endswith('.NS'):
+            return self.fetch_nse_data(symbol, start_date, end_date, interval)
+        
+        logger.info(f"Fetching {interval} data for {symbol} from {start_date} to {end_date} via Binance")
+        
+        import requests
+        import time
+        
+        binance_interval_map = {
+            'minute': '1m',
+            '5minute': '5m',
+            '15minute': '15m',
+            '1hour': '1h',
+            'day': '1d'
+        }
+        b_interval = binance_interval_map.get(interval, '5m')
+        b_symbol = symbol.replace('.NS', '')
+        
+        base_url = "https://api.binance.com/api/v3/klines"
+        start_ts = int(start_date.timestamp() * 1000)
+        end_ts = int((end_date + timedelta(days=1)).timestamp() * 1000)
+        
+        all_klines = []
+        current_start = start_ts
+        
+        while current_start < end_ts:
+            params = {
+                "symbol": b_symbol,
+                "interval": b_interval,
+                "startTime": current_start,
+                "endTime": end_ts,
+                "limit": 1000
+            }
+            try:
+                resp = requests.get(base_url, params=params, timeout=10)
+                if resp.status_code != 200:
+                    logger.error(f"Binance API error {resp.status_code}: {resp.text}")
+                    break
+                data = resp.json()
+                if not data:
+                    break
+                all_klines.extend(data)
+                current_start = data[-1][6] + 1
+                time.sleep(0.1) # Rate limit respect
+            except Exception as e:
+                logger.error(f"Binance request failed: {e}")
+                break
+                
+        if not all_klines:
+            logger.warning(f"No data found for {symbol} on Binance")
             return pd.DataFrame()
+            
+        cols = [
+            'timestamp', 'open', 'high', 'low', 'close', 'volume', 
+            'close_time', 'quote_asset_volume', 'trade_count', 
+            'taker_buy_base', 'taker_buy_quote', 'ignore'
+        ]
+        df = pd.DataFrame(all_klines, columns=cols)
+        
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'trade_count', 'taker_buy_base']
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['symbol'] = symbol
+        
+        # Crypto VWAP reset
+        df = df.set_index('timestamp')
+        df['vwap'] = self._compute_daily_vwap(df)
+        df = df.reset_index()
+        
+        # L2 Order Flow Simulation using Binance true Taker volumes
+        df['buy_volume'] = df['taker_buy_base']
+        df['sell_volume'] = df['volume'] - df['taker_buy_base']
+        df['ask_volume'] = df['sell_volume'] # Sell hits bid, buy hits ask, wait -> ask_volume is volume resting on ask, but we use it as flow
+        df['bid_volume'] = df['buy_volume']
+        
+        # Add required empty columns
+        empty_cols = ['bid_price', 'ask_price', 'oi', 'spread', 'aggressor_side',
+                      'options_pcr', 'options_max_pain', 'options_unusual_oi',
+                      'nifty_futures_basis', 'fii_net_flow', 'dii_net_flow']
+        for c in empty_cols:
+            df[c] = np.nan
+            
+        # Reorder to internal schema
+        out_cols = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume', 'vwap',
+                    'bid_price', 'ask_price', 'bid_volume', 'ask_volume', 'oi', 'spread',
+                    'trade_count', 'aggressor_side', 'buy_volume', 'sell_volume',
+                    'options_pcr', 'options_max_pain', 'options_unusual_oi',
+                    'nifty_futures_basis', 'fii_net_flow', 'dii_net_flow']
+        
+        for c in out_cols:
+            if c not in df.columns:
+                df[c] = np.nan
+        df = df[out_cols]
+        
+        return df
 
 
 class DataStorage:
@@ -344,7 +417,7 @@ class DataStorage:
                     logger.error(f"Failed to read {filepath}: {e}")
         
         if dfs:
-            combined = pd.concat(dfs).sort_values('timestamp').drop_duplicates()
+            combined = pd.concat(dfs).sort_values('timestamp').drop_duplicates(subset=['symbol', 'timestamp'])
             # Filter by date range
             if 'timestamp' in combined.columns:
                 combined['timestamp'] = pd.to_datetime(combined['timestamp'])

@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/9f3bc0c7ebbe4f6a9d4975faa82acda2/artifacts
+end_time: 1780260218834
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 9f3bc0c7ebbe4f6a9d4975faa82acda2
+run_name: abundant-sponge-816
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780260165107
+status: 3
+tags: []
+user_id: khand

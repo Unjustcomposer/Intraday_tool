@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/c31b42c685c3465bb2ff1babe0f61f09/artifacts
+end_time: 1780303439744
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: c31b42c685c3465bb2ff1babe0f61f09
+run_name: melodic-bug-310
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780303386800
+status: 3
+tags: []
+user_id: khand

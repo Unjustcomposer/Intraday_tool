@@ -2,12 +2,14 @@ import pandas as pd
 import numpy as np
 import logging
 import os
-from .flow_features import relative_volume, vwap_deviation, volume_delta, index_relative_strength, kyles_lambda, amihud_illiquidity, trade_size_distribution
+from .flow_features import relative_volume, vwap_deviation, volume_delta, index_relative_strength, kyles_lambda, amihud_illiquidity, trade_size_distribution, order_flow_imbalance
 from .trend_features import ema_slope, adx, momentum
 from .volatility_features import atr, realized_volatility, bollinger_width, volatility_percentile, range_expansion, garman_klass_volatility
 from .time_features import time_of_day_features
 from .sentiment_features import encode_sentiment
-from .market_context_features import options_pcr_ratio, options_max_pain_deviation, options_unusual_oi_signal, nifty_futures_basis_pct, fii_dii_net_flow_momentum
+from .market_context_features import nifty_futures_basis_pct, fii_dii_net_flow_momentum
+from .microstructure import volume_synchronized_probability_of_informed_trading, trade_sign_correlation
+from .stat_arb import hurst_exponent, statistical_divergence
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +46,9 @@ class FeatureStore:
         features['kyles_lambda'] = kyles_lambda(df)
         features['amihud_illiquidity'] = amihud_illiquidity(df)
         features['trade_size_dist'] = trade_size_distribution(df)
+        features['ofi_proxy'] = order_flow_imbalance(df)
         
-        # === Options Flow Features ===
-        features['options_pcr_ratio'] = options_pcr_ratio(df)
-        features['options_max_pain_dev'] = options_max_pain_deviation(df)
-        features['options_unusual_oi'] = options_unusual_oi_signal(df)
+        # Options Flow Features REMOVED (due to extreme retail lag)
         
         # === Cross-Asset Context Features ===
         features['nifty_basis_pct'] = nifty_futures_basis_pct(df)
@@ -70,6 +70,14 @@ class FeatureStore:
         # Drop vol_percentile in favor of gk_vol to reduce correlation
         # features['vol_percentile'] = volatility_percentile(df, ...)
         
+        # === Advanced Microstructure ===
+        features['vpin'] = volume_synchronized_probability_of_informed_trading(df)
+        features['trade_sign_corr'] = trade_sign_correlation(df)
+        
+        # === Statistical Arbitrage ===
+        features['hurst'] = hurst_exponent(df)
+        features['divergence'] = statistical_divergence(df)
+        
         # === Time-of-Day Features ===
         time_feats = time_of_day_features(df)
         for col in time_feats.columns:
@@ -85,8 +93,8 @@ class FeatureStore:
         features = features.replace([np.inf, -np.inf], np.nan)
         features = self._daily_aware_fill(features)
         
-        # === Drop highly correlated features ===
-        features = self._drop_correlated_features(features, threshold=0.95)
+        # === Correlation dropping moved to training phase to avoid lookahead bias ===
+        # features = self._drop_correlated_features(features, threshold=0.95)
         
         # Track feature columns (exclude raw OHLCV, metadata, AND unimplemented mock data columns)
         raw_cols = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -95,9 +103,7 @@ class FeatureStore:
         # Columns that require real data sources not yet implemented.
         # These are NaN placeholders and must NOT be used as model features.
         unimplemented_cols = ['options_pcr', 'options_max_pain', 'options_unusual_oi',
-                              'nifty_futures_basis', 'fii_net_flow', 'dii_net_flow',
-                              'options_pcr_ratio', 'options_max_pain_dev', 
-                              'options_unusual_oi', 'nifty_basis_pct', 'fii_dii_flow_mom']
+                              'nifty_futures_basis', 'fii_net_flow', 'dii_net_flow']
         exclude_cols = set(raw_cols) | set(unimplemented_cols)
         
         # Also exclude any all-NaN columns as a safety net
@@ -121,7 +127,10 @@ class FeatureStore:
             raw_cols = ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                         'vwap', 'bid_price', 'ask_price', 'bid_volume', 'ask_volume',
                         'oi', 'spread', 'trade_count', 'aggressor_side']
-            self._feature_columns = [c for c in features_df.columns if c not in raw_cols]
+            unimplemented_cols = ['options_pcr', 'options_max_pain', 'options_unusual_oi',
+                                  'nifty_futures_basis', 'fii_net_flow', 'dii_net_flow']
+            exclude = set(raw_cols) | set(unimplemented_cols)
+            self._feature_columns = [c for c in features_df.columns if c not in exclude]
         
         available = [c for c in self._feature_columns if c in features_df.columns]
         return features_df[available]
@@ -153,13 +162,23 @@ class FeatureStore:
             mask = df.index.isin(group_idx)
             result.loc[mask, numeric_cols] = df.loc[mask, numeric_cols].ffill()
         
-        # Context-aware NaN fill: volatility features use expanding mean (never 0)
+        # Context-aware NaN fill: volatility features use WITHIN-DAY expanding mean only
         vol_cols = [c for c in result.columns if c in
                     ('atr', 'gk_vol', 'realized_vol', 'bb_width', 'range_exp')]
         for col in vol_cols:
             if col in result.columns:
-                expanding_mean = result[col].expanding(min_periods=1).mean()
-                result[col] = result[col].fillna(expanding_mean)
+                if hasattr(result.index, 'date'):
+                    daily_expanding = result.groupby(result.index.date)[col].transform(
+                        lambda x: x.expanding(min_periods=1).mean()
+                    )
+                elif 'timestamp' in result.columns:
+                    dates = pd.to_datetime(result['timestamp']).dt.date
+                    daily_expanding = result.groupby(dates)[col].transform(
+                        lambda x: x.expanding(min_periods=1).mean()
+                    )
+                else:
+                    daily_expanding = result[col].expanding(min_periods=1).mean()
+                result[col] = result[col].fillna(daily_expanding)
         
         # All remaining NaN → 0 (safe for momentum, sentiment, session flags)
         result = result.fillna(0)
@@ -211,25 +230,17 @@ class FeatureStore:
         
         if method == 'zscore':
             for col in available:
-                mean = df[col].mean()
-                std = df[col].std()
-                if std > 0:
-                    result[col] = (df[col] - mean) / std
-                    stats[col] = {'mean': mean, 'std': std}
-                else:
-                    result[col] = 0.0
-                    stats[col] = {'mean': mean, 'std': 1.0}
+                rolling_mean = df[col].shift(1).rolling(window=1000, min_periods=1).mean()
+                rolling_std = df[col].shift(1).rolling(window=1000, min_periods=1).std()
+                rolling_std = rolling_std.replace(0, 1.0)
+                result[col] = (df[col] - rolling_mean) / rolling_std
         elif method == 'minmax':
             for col in available:
-                min_val = df[col].min()
-                max_val = df[col].max()
-                range_val = max_val - min_val
-                if range_val > 0:
-                    result[col] = (df[col] - min_val) / range_val
-                    stats[col] = {'min': min_val, 'max': max_val}
-                else:
-                    result[col] = 0.0
-                    stats[col] = {'min': min_val, 'max': min_val + 1.0}
+                rolling_min = df[col].shift(1).rolling(window=1000, min_periods=1).min()
+                rolling_max = df[col].shift(1).rolling(window=1000, min_periods=1).max()
+                range_val = rolling_max - rolling_min
+                range_val = range_val.replace(0, 1.0)
+                result[col] = (df[col] - rolling_min) / range_val
         
         return result, stats
         

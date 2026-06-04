@@ -1,0 +1,2 @@
+timestamp,symbol,direction,entry_price,stop_loss,target_1,target_2,risk_reward,confidence,regime,vix,atr,valid_until
+2026-06-03 14:30:00,DRREDDY,BUY,1265.1,1262.11,1269.59,1272.58,1.5,66.3,unknown,28.1,2.99,15:10 IST

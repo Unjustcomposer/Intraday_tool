@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/7618390d80734e66b82c13169c7c4118/artifacts
+end_time: 1780308787390
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 7618390d80734e66b82c13169c7c4118
+run_name: sassy-ram-754
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780308289236
+status: 3
+tags: []
+user_id: khand

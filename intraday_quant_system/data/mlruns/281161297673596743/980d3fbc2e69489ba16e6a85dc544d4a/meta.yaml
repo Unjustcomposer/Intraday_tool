@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/980d3fbc2e69489ba16e6a85dc544d4a/artifacts
+end_time: 1780125572245
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 980d3fbc2e69489ba16e6a85dc544d4a
+run_name: exultant-grub-894
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780125344504
+status: 3
+tags: []
+user_id: khand

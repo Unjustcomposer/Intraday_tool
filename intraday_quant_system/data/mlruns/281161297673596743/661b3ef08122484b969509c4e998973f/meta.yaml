@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/281161297673596743/661b3ef08122484b969509c4e998973f/artifacts
+end_time: 1780309072087
+entry_point_name: ''
+experiment_id: '281161297673596743'
+lifecycle_stage: active
+run_id: 661b3ef08122484b969509c4e998973f
+run_name: gregarious-sheep-594
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1780309023577
+status: 3
+tags: []
+user_id: khand
