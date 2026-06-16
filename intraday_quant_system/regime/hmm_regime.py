@@ -45,11 +45,13 @@ class RegimeDetector:
         self.is_fitted = True
         
         # Store volatility percentiles for crisis detection
-        vol_col = features.iloc[:, 1]  # ATR column
+        vol_col = features['atr']  # ATR column
+        rv5_col = features['realized_vol_5bar'].dropna()
         self.vol_percentiles = {
             'p50': float(vol_col.median()),
             'p90': float(vol_col.quantile(0.90)),
             'p95': float(vol_col.quantile(0.95)),
+            'rv5_p90': float(rv5_col.quantile(0.90)) if len(rv5_col) > 0 else 0.0,
         }
         
     def predict(self, df: pd.DataFrame) -> pd.Series:
@@ -89,8 +91,15 @@ class RegimeDetector:
         
         # Override to 'crisis' if current volatility exceeds 95th percentile of training data
         if self.vol_percentiles:
-            atr_vals = features.loc[valid_idx].iloc[:, 1]
+            atr_vals = features.loc[valid_idx]['atr']
             crisis_mask = atr_vals > self.vol_percentiles['p95']
+            
+            # Fix #14: Instantaneous 5-bar realized volatility override
+            if 'rv5_p90' in self.vol_percentiles:
+                rv5_vals = features.loc[valid_idx]['realized_vol_5bar']
+                instant_crisis_mask = rv5_vals > self.vol_percentiles['rv5_p90']
+                crisis_mask = crisis_mask | instant_crisis_mask
+                
             crisis_indices = valid_idx[crisis_mask.values]
             if len(crisis_indices) > 0:
                 preds.loc[crisis_indices] = 'crisis'
@@ -101,6 +110,8 @@ class RegimeDetector:
         features = pd.DataFrame(index=df.index)
         features['log_ret'] = np.log(df['close'] / df['close'].shift(1))
         features['atr'] = atr(df)
+        # Fix #14: Instantaneous 5-bar realized volatility to bypass HMM lag
+        features['realized_vol_5bar'] = features['log_ret'].rolling(5).std()
         return features
 
     def _fallback_regime(self, df: pd.DataFrame) -> pd.Series:

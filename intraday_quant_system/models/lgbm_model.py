@@ -13,6 +13,13 @@ from sklearn.model_selection import TimeSeriesSplit
 logger = logging.getLogger(__name__)
 
 
+class _IdentityCalibrator:
+    """Passthrough calibrator that returns raw probabilities unchanged.
+    Used when isotonic regression fails the monotonicity safety check."""
+    def predict(self, x):
+        return x
+
+
 class LGBMAlphaModel:
     """
     Primary alpha model using LightGBM.
@@ -64,17 +71,30 @@ class LGBMAlphaModel:
         closes = df['close'].values
         atrs = df['atr'].values
         
-        for i in range(len(df) - horizon_minutes):
+        for i in range(len(df) - 1):
             current_price = closes[i]
             current_atr = atrs[i]
             
             if np.isnan(current_atr) or current_atr == 0:
                 continue
                 
+            # Fix #19: Dynamic Barrier Horizons
+            # Scale horizon inversely with volatility (low vol = longer time to hit target)
+            atr_pct = current_atr / current_price
+            baseline_atr_pct = 0.003  # e.g., 0.3% expected ATR for 15m bar
+            scaling_factor = baseline_atr_pct / atr_pct if atr_pct > 0 else 1.0
+            
+            # Base horizon is in minutes. If we use 15m bars, horizon_bars = horizon_minutes // 15
+            base_horizon_bars = max(1, horizon_minutes // 15)
+            dynamic_horizon_bars = int(np.clip(base_horizon_bars * scaling_factor, 1, 16)) # max ~4 hours
+            
+            # Ensure we don't look past the end of the array
+            safe_horizon = min(dynamic_horizon_bars, len(df) - i - 1)
+                
             target_up = current_price + (atr_mult_up * current_atr)
             target_down = current_price - (atr_mult_down * current_atr)
             
-            window = closes[i+1 : i+1+horizon_minutes]
+            window = closes[i+1 : i+1+safe_horizon]
             
             for price in window:
                 if price >= target_up:
@@ -108,17 +128,26 @@ class LGBMAlphaModel:
         closes = df['close'].values
         atrs = df['atr'].values
         
-        for i in range(len(df) - horizon_minutes):
+        for i in range(len(df) - 1):
             current_price = closes[i]
             current_atr = atrs[i]
             
             if np.isnan(current_atr) or current_atr == 0:
                 continue
                 
+            # Fix #19: Dynamic Barrier Horizons for directional labels
+            atr_pct = current_atr / current_price
+            baseline_atr_pct = 0.003
+            scaling_factor = baseline_atr_pct / atr_pct if atr_pct > 0 else 1.0
+            
+            base_horizon_bars = max(1, horizon_minutes // 15)
+            dynamic_horizon_bars = int(np.clip(base_horizon_bars * scaling_factor, 1, 16))
+            safe_horizon = min(dynamic_horizon_bars, len(df) - i - 1)
+                
             target_up = current_price + (atr_mult * current_atr)
             target_down = current_price - (atr_mult * current_atr)
             
-            window = closes[i+1 : i+1+horizon_minutes]
+            window = closes[i+1 : i+1+safe_horizon]
             
             for price in window:
                 if price >= target_up:
@@ -136,19 +165,32 @@ class LGBMAlphaModel:
         Train using Purged Walk-Forward Cross Validation (TimeSeriesSplit with gap).
         Prevents lookahead bias and label leakage.
         """
-        logger.info(f"Training LightGBM on {len(X)} samples with Purged CV")
+        logger.info(f"Training LightGBM on {len(X)} samples with explicit Purged CV")
         
-        # Walk-forward CV: iterate through folds, using the LAST fold for final training.
-        # The last fold has the largest training set and most recent validation data,
-        # which is the correct choice for walk-forward temporal validation.
-        tscv = TimeSeriesSplit(n_splits=3, gap=15)
-        for train_idx, val_idx in tscv.split(X):
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        # Fix #13: Purged Cross-Validation Logic
+        # Manually purging the overlap between train and validation folds.
+        total_len = len(X)
+        val_size = 0.2
+        purge_bars = 15     # Avoid forward leakage
+        embargo_bars = 15   # Avoid backward leakage
+        
+        train_idx_end = int(total_len * (1 - val_size))
+        train_end_purged = max(0, train_idx_end - purge_bars)
+        val_start_embargoed = min(total_len, train_idx_end + embargo_bars)
+        
+        if train_end_purged < 50 or (total_len - val_start_embargoed) < 10:
+            logger.warning("Insufficient samples for Purged CV. Using basic split.")
+            X_train, X_val = X.iloc[:int(total_len*0.8)], X.iloc[int(total_len*0.8):]
+            y_train, y_val = y.iloc[:int(total_len*0.8)], y.iloc[int(total_len*0.8):]
+        else:
+            X_train = X.iloc[:train_end_purged]
+            y_train = y.iloc[:train_end_purged]
+            X_val = X.iloc[val_start_embargoed:]
+            y_val = y.iloc[val_start_embargoed:]
             
-            pos_rate = y_train.mean()
-            if pos_rate < 0.1 or pos_rate > 0.9:
-                logger.warning(f"Label imbalance in fold: {pos_rate:.1%} positive.")
+        pos_rate = y_train.mean()
+        if pos_rate < 0.1 or pos_rate > 0.9:
+            logger.warning(f"Label imbalance in fold: {pos_rate:.1%} positive.")
         
         # Fit base model with early stopping
         self.base_model.fit(
@@ -160,13 +202,41 @@ class LGBMAlphaModel:
             ]
         )
         
-        # Apply Platt Scaling (Isotonic Regression) on the validation set
+        # Apply Isotonic Calibration on the validation set — with safety check
         logger.info("Calibrating model using isotonic regression on validation set...")
         
-        # We manually fit the calibrator to avoid the cv='prefit' bug in newer sklearn
         raw_probs = self.base_model.predict_proba(X_val)[:, 1]
-        self.calibrator = IsotonicRegression(out_of_bounds='clip')
-        self.calibrator.fit(raw_probs, y_val)
+        candidate_calibrator = IsotonicRegression(out_of_bounds='clip')
+        candidate_calibrator.fit(raw_probs, y_val)
+        
+        # SAFETY CHECK: Isotonic regression on small datasets can INVERT the
+        # probability mapping (e.g., raw 0.7 → calibrated 0.3), which flips
+        # the entire signal direction. Check monotonicity via Spearman correlation.
+        from scipy.stats import spearmanr
+        calibrated_probs = candidate_calibrator.predict(raw_probs)
+        if len(set(calibrated_probs)) > 1 and len(set(raw_probs)) > 1:
+            corr, _ = spearmanr(raw_probs, calibrated_probs)
+        else:
+            corr = 0.0  # Degenerate case — all same value
+        
+        if corr >= 0.8:
+            self.calibrator = candidate_calibrator
+            logger.info(f"Isotonic calibration accepted (Spearman ρ={corr:.3f})")
+        else:
+            # Fix #11: Platt Scaling Calibration Fallback
+            from sklearn.linear_model import LogisticRegression
+            logger.warning(f"Isotonic calibration REJECTED (Spearman ρ={corr:.3f} < 0.8). "
+                           f"Falling back to Platt Scaling (Logistic Regression) to maintain conformal safety.")
+            platt_calibrator = LogisticRegression()
+            platt_calibrator.fit(raw_probs.reshape(-1, 1), y_val)
+            
+            class PlattWrapper:
+                def __init__(self, model):
+                    self.model = model
+                def predict(self, x):
+                    return self.model.predict_proba(x.reshape(-1, 1))[:, 1]
+                    
+            self.calibrator = PlattWrapper(platt_calibrator)
         
         self.is_fitted = True
         self.feature_names = list(X.columns)

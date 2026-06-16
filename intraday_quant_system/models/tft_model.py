@@ -51,8 +51,14 @@ class TFTNetwork(nn.Module):
         seq_len = x.size(1)
         mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device)
         
+        # Fix #15: TFT Padding Dilution
+        # Create boolean mask for padded elements (True where sequence is padded with 0s)
+        # This prevents the Transformer from attending to zero-padded sequence steps,
+        # which stops gradients from diluting on short context horizons.
+        src_key_padding_mask = (x == 0).all(dim=-1).to(x.device)
+        
         # Transformer expects (batch_size, seq_len, embed_dim) with batch_first=True
-        out = self.transformer(x, mask=mask)
+        out = self.transformer(x, mask=mask, src_key_padding_mask=src_key_padding_mask)
         
         # Use the last time step for prediction
         last_step_out = out[:, -1, :]

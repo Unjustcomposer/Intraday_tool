@@ -31,7 +31,7 @@ from data.market_data import MarketDataEngine
 from features.feature_store import FeatureStore
 from features.volatility_features import atr as compute_atr
 from models.lgbm_model import LGBMAlphaModel
-from models.xgboost_model import XGBoostAlphaModel
+from models.tabnet_model import TabNetModel
 from models.tft_model import TemporalFusionTransformerModel
 from models.catboost_meta_labeler import MetaLabeler
 from signals.ensemble import EnsembleScorer
@@ -140,8 +140,14 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
         lgbm_model = LGBMAlphaModel(config=config.get('models', {}).get('lgbm', {}))
         lgbm_model.train(X_primary_train, y_primary_train, val_size=0.15)
         
-        xgb_model = XGBoostAlphaModel()
-        xgb_model.train(X_primary_train, y_primary_train, val_size=0.15)
+        # TabNet (Deep Neural Network) to decorrelate the ensemble
+        from models.tabnet_model import TabNetModel
+        tabnet_model = TabNetModel(model_type='classifier')
+        X_tr_np = X_primary_train.values.astype(np.float32)
+        y_tr_np = y_primary_train.astype(np.int64)
+        X_va_np = X_val.values.astype(np.float32)
+        y_va_np = y_val.astype(np.int64)
+        tabnet_model.fit(X_train=X_tr_np, y_train=y_tr_np, X_valid=X_va_np, y_valid=y_va_np, max_epochs=20, patience=5)
         
         # Save feature importances to local data/ directory for logging as artifacts
         try:
@@ -150,10 +156,10 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
                 os.makedirs("./data", exist_ok=True)
                 lgbm_imp.to_csv(f"./data/feature_importance_{symbol}_lgbm.csv", index=False)
             
-            xgb_imp = xgb_model.get_feature_importance()
-            if not xgb_imp.empty:
-                os.makedirs("./data", exist_ok=True)
-                xgb_imp.to_csv(f"./data/feature_importance_{symbol}_xgboost.csv", index=False)
+            # tabnet_imp = tabnet_model.get_feature_importance()
+            # if not tabnet_imp.empty:
+            #     os.makedirs("./data", exist_ok=True)
+            #     tabnet_imp.to_csv(f"./data/feature_importance_{symbol}_tabnet.csv", index=False)
         except Exception as e:
             logger.warning(f"Could not save feature importance: {e}")
         
@@ -187,7 +193,8 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
         
         # 4. Generate predictions on validation set
         lgbm_probs = lgbm_model.predict_proba(X_val)
-        xgb_probs = xgb_model.predict_proba(X_val)
+        tabnet_preds = tabnet_model.predict_proba(X_va_np)
+        tabnet_probs = tabnet_preds[:, 1] if tabnet_preds.shape[1] > 1 else tabnet_preds[:, 0]
         
         tft_probs = np.ones(len(X_val)) * 0.5
         if tft_model.is_trained and len(val_df) > seq_len:
@@ -217,8 +224,15 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
         pending_exit = None   # dict with price, queue_pos
         atrs = val_df['atr'].values if 'atr' in val_df.columns else np.ones(len(val_df))
         
-        # Microstructure proxy if spread is not provided
-        spreads = val_df['spread'].values if 'spread' in val_df.columns else (atrs * 0.1)
+        # Fix #9: True Realized Spread calculation
+        # If true spread is missing, calculate a dynamic proxy based on volume liquidity rather than a static ATR percentage.
+        if 'spread' in val_df.columns and not val_df['spread'].isna().all():
+            spreads = val_df['spread'].values
+        else:
+            vols = val_df['volume'].values if 'volume' in val_df.columns else np.ones(len(val_df))
+            med_vol = np.nanmedian(vols) if len(vols) > 0 else 1.0
+            vol_ratio = np.clip(med_vol / np.maximum(vols, 1.0), 0.5, 3.0)
+            spreads = atrs * vol_ratio * 0.05
         
         for i in range(len(X_val)):
             current_open = opens[i]
@@ -235,7 +249,9 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
             if pending_exit and position != 0:
                 exit_price = pending_exit['price']
                 is_gap = (current_open < exit_price) if position == 1 else (current_open > exit_price)
-                is_cross = (current_low <= exit_price <= current_high)
+                # Fix #3: Queue Position Fill Assumption
+                # Require price to trade *through* the limit price to assume a fill
+                is_cross = (current_low < exit_price and current_high >= exit_price) if position == 1 else (current_high > exit_price and current_low <= exit_price)
                 
                 if is_gap:
                     pending_exit['queue_pos'] = 0
@@ -249,7 +265,13 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
                     # Dynamic Tiered Slippage: Spread/2 represents expected slippage cost to cross the book
                     dynamic_slippage = (current_spread / 2) / fill_price
                     trade_return = position * (fill_price - entry_price) / entry_price
-                    trade_return -= (dynamic_slippage + round_trip_cost)
+                    
+                    # Fix #20: Tax Ignorance in Backtest
+                    # Absolute flat fee deduction for tax/brokerage (₹40 round trip)
+                    # Assuming a base ₹1,00,000 per trade, ₹40 = 0.04% absolute drag per trade
+                    flat_fee_pct = 40.0 / 100000.0
+                    trade_return -= (dynamic_slippage + round_trip_cost + flat_fee_pct)
+                    
                     trades.append({
                         'return': trade_return,
                         'side': 'long' if position == 1 else 'short',
@@ -265,10 +287,11 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
                 # For long, we want to buy at limit (price must drop to or below limit)
                 if pending_entry['side'] == 'buy':
                     is_gap = current_open < entry_target
-                    is_cross = current_low <= entry_target <= current_high
+                    # Fix #3: Queue Position Fill Assumption
+                    is_cross = current_low < entry_target and current_high >= entry_target
                 else:
                     is_gap = current_open > entry_target
-                    is_cross = current_low <= entry_target <= current_high
+                    is_cross = current_high > entry_target and current_low <= entry_target
                     
                 if is_gap:
                     pending_entry['queue_pos'] = 0
@@ -288,10 +311,10 @@ def run_walk_forward(symbol: str, df: pd.DataFrame, feature_cols: list, config: 
             
             score = ensemble.compute_score(
                 lgbm_prob=lgbm_probs[i],
-                tabnet_prob=xgb_probs[i],
+                tabnet_prob=tabnet_probs[i],
                 tft_prob=tft_probs[i],
                 meta_prob=meta_probs[i],
-                sentiment_score=0.0,
+                sentiment_score=0.0, # Deep historical news is unavailable, default to 0.0 for backtesting.
                 regime_score=0.5,
                 symbol=symbol
             )
@@ -642,11 +665,12 @@ def main():
                     
             # Log feature importances as artifacts if saved
             lgbm_imp_file = f"./data/feature_importance_{symbol}_lgbm.csv"
-            xgb_imp_file = f"./data/feature_importance_{symbol}_xgboost.csv"
+            tabnet_imp_file = f"./data/feature_importance_{symbol}_tabnet.csv"
+            
             if os.path.exists(lgbm_imp_file):
                 mlflow.log_artifact(lgbm_imp_file)
-            if os.path.exists(xgb_imp_file):
-                mlflow.log_artifact(xgb_imp_file)
+            if os.path.exists(tabnet_imp_file):
+                mlflow.log_artifact(tabnet_imp_file)
         
         # 4. Monte Carlo stress test & DSR Calculation
         logger.info(f"\n{'='*50}")

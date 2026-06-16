@@ -49,6 +49,10 @@ class MetaLabeler:
         """
         logger.info(f"Training MetaLabeler on {len(X_features)} samples using Purged Walk-Forward CV")
         
+        # Fix #12: Meta-Labeler Target Leakage
+        # Shift the outcome by -1 so that the model at bar T predicts the outcome of a trade taken at T+1 (execution slippage)
+        y_trade_outcome = y_trade_outcome.shift(-1).fillna(0)
+        
         # Combine primary predictions with features
         X_combined = X_features.copy()
         X_combined['primary_pred'] = X_primary_preds
@@ -136,10 +140,20 @@ class MetaLabeler:
                     if precision >= 0.60:
                         best_tau = tau
                         break
-                last_fold_conformal = float(best_tau)
+                # Cap the threshold to prevent absurd dead zones on small/noisy val sets.
+                # Without this, thresholds like 0.93 create a dead zone from 0.07-0.93,
+                # making it impossible for any weighted ensemble score to pass.
+                last_fold_conformal = float(np.clip(best_tau, 0.50, 0.65))
                 
             except Exception as e:
                 logger.error(f"Failed to train Fold {fold+1}: {e}")
+            finally:
+                # Fix #17: CatBoost Memory Leak
+                # Explicitly delete pools and collect garbage to prevent memory explosion during walk-forward CV
+                if 'tr_pool' in locals(): del tr_pool
+                if 'va_pool' in locals(): del va_pool
+                import gc
+                gc.collect()
                 
         # Use last fold's model as production model to prevent label contamination.
         # Refitting on ALL data would let the model see labels it will predict on.

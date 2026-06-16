@@ -42,6 +42,9 @@ def time_of_day_features(df: pd.DataFrame) -> pd.DataFrame:
     time_minutes = np.clip(time_minutes, 0, 375)
     features['time_minutes'] = time_minutes
     
+    # Fix #7: Explicitly flag the erratic first hour
+    features['is_first_hour'] = (hours == 9).astype(float)
+    
     # Cyclical encoding (avoids discontinuity at day boundaries)
     total_session_minutes = 375  # 9:15 to 15:30
     features['time_sin'] = np.sin(2 * np.pi * time_minutes / total_session_minutes)

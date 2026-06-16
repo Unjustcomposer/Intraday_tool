@@ -3,20 +3,23 @@ import pandas as pd
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import os
+import threading
 
 from .broker_interface import BrokerClient
 
 try:
     from fyers_apiv3 import fyersModel
+    from fyers_apiv3.FyersWebsocket import data_ws
 except ImportError:
     fyersModel = None
+    data_ws = None
 
 logger = logging.getLogger(__name__)
 
 class FyersBroker(BrokerClient):
     """
     Fyers API implementation of the BrokerClient interface.
-    Handles authentication, data fetching, and order execution.
+    Handles authentication, data fetching, order execution, and L2 WebSocket streaming.
     """
     
     def __init__(self, client_id: str, secret_key: str, redirect_uri: str = "http://127.0.0.1:5000/login"):
@@ -25,6 +28,11 @@ class FyersBroker(BrokerClient):
         self.redirect_uri = redirect_uri
         self.access_token = None
         self.fyers = None
+        
+        # WebSocket internals
+        self.ws = None
+        self.ws_thread = None
+        self.l2_cache = {}
         
         # Load token from environment or config if it exists
         self.access_token = os.environ.get("FYERS_ACCESS_TOKEN")
@@ -212,3 +220,87 @@ class FyersBroker(BrokerClient):
         except Exception as e:
             logger.error(f"Fyers API Exception in get_order_book: {e}")
             return pd.DataFrame()
+
+    def connect_websocket(self, symbols: List[str]):
+        """Starts a background WebSocket daemon subscribing to Level 2 Data."""
+        if not data_ws:
+            logger.error("fyers_apiv3 not installed, cannot start WS.")
+            return
+            
+        if not self.access_token:
+            logger.error("Cannot connect WS without access token.")
+            return
+            
+        fyers_symbols = [self._translate_symbol(sym) for sym in symbols]
+        
+        def on_message(message):
+            try:
+                # Fyers message is usually a dict. DepthUpdate has 'bids' and 'asks' lists.
+                if isinstance(message, dict) and 'symbol' in message:
+                    sym = message['symbol']
+                    # Translate back to standard symbol e.g., NSE:RELIANCE-EQ -> RELIANCE.NS
+                    std_sym = sym.replace("NSE:", "").replace("-EQ", "") + ".NS"
+                    
+                    # Update cache if bid/ask data is present
+                    if std_sym not in self.l2_cache:
+                        self.l2_cache[std_sym] = {'bids': [], 'asks': [], 'ltp': 0.0}
+                    
+                    if 'bids' in message and 'asks' in message:
+                        self.l2_cache[std_sym]['bids'] = message.get('bids', [])
+                        self.l2_cache[std_sym]['asks'] = message.get('asks', [])
+                    
+                    if 'ltp' in message:
+                        self.l2_cache[std_sym]['ltp'] = message['ltp']
+            except Exception as e:
+                logger.debug(f"WS Parse error: {e}")
+
+        def on_error(message):
+            logger.error(f"Fyers WS Error: {message}")
+
+        def on_close(message):
+            logger.info(f"Fyers WS Closed: {message}")
+
+        def on_open():
+            logger.info(f"Fyers WS Opened. Subscribing to DepthUpdate for {len(fyers_symbols)} symbols...")
+            self.ws.subscribe(symbols=fyers_symbols, data_type="DepthUpdate")
+
+        # Fyers requires token format: APP_ID:ACCESS_TOKEN
+        token_str = f"{self.client_id}:{self.access_token}"
+        
+        self.ws = data_ws.FyersDataSocket(
+            access_token=token_str,
+            log_path="",
+            litemode=False, # We want full market depth
+            write_to_file=False,
+            reconnect=True,
+            on_connect=on_open,
+            on_close=on_close,
+            on_error=on_error,
+            on_message=on_message
+        )
+        
+        self.ws_thread = threading.Thread(target=self.ws.connect, daemon=True)
+        self.ws_thread.start()
+        logger.info(f"Spawned Fyers WS Thread for {len(symbols)} symbols.")
+
+    def get_ofi(self, symbol: str) -> float:
+        """
+        Computes real-time Order Flow Imbalance (OFI) from L2 Top 5 Bids/Asks.
+        Returns [-1.0 to 1.0]. Positive means buying pressure (heavy bids).
+        """
+        if symbol not in self.l2_cache:
+            return 0.0
+            
+        depth = self.l2_cache[symbol]
+        bids = depth.get('bids', [])
+        asks = depth.get('asks', [])
+        
+        # Sum volume of top 5 bids/asks
+        total_bid_vol = sum([b.get('volume', 0) for b in bids[:5]])
+        total_ask_vol = sum([a.get('volume', 0) for a in asks[:5]])
+        
+        total_vol = total_bid_vol + total_ask_vol
+        if total_vol == 0:
+            return 0.0
+            
+        return (total_bid_vol - total_ask_vol) / total_vol

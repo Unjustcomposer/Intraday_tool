@@ -1,0 +1,2 @@
+symbol,direction,entry_price,stop_loss,target_1,target_2,risk_reward,confidence,regime,vix,atr,timestamp,valid_until,status
+RELIANCE.NS,BUY,2800.0,2780.0,2830.0,2860.0,1.5,65.0,bullish,15.5,20.0,2026-06-10 17:15:00,15:10 IST,ACTIVE

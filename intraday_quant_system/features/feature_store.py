@@ -102,8 +102,11 @@ class FeatureStore:
                     'oi', 'spread', 'trade_count', 'aggressor_side']
         # Columns that require real data sources not yet implemented.
         # These are NaN placeholders and must NOT be used as model features.
+        # Fix #18: 'sentiment_score' is excluded from ML inputs to prevent lag/lookahead, 
+        # but kept in the dataframe for CallGenerator execution vetoing.
         unimplemented_cols = ['options_pcr', 'options_max_pain', 'options_unusual_oi',
-                              'nifty_futures_basis', 'fii_net_flow', 'dii_net_flow']
+                              'nifty_futures_basis', 'fii_net_flow', 'dii_net_flow',
+                              'sentiment_score']
         exclude_cols = set(raw_cols) | set(unimplemented_cols)
         
         # Also exclude any all-NaN columns as a safety net

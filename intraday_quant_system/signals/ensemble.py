@@ -20,37 +20,22 @@ class EnsembleScorer:
       regime_weight     = 0.10
     """
     def __init__(self):
-        # Regime-conditional weights mapping
+        # Regime-conditional weights mapping (LGBM + TabNet Decorrelation)
         self.regime_weights = {
             'quiet': {
-                'lgbm': 0.60,
-                'meta': 0.20,
-                'regime': 0.10,
-                'sentiment': 0.10
+                'lgbm': 0.30, 'tabnet': 0.30, 'meta': 0.20, 'regime': 0.10, 'sentiment': 0.10
             },
             'trending': {
-                'lgbm': 0.50,
-                'meta': 0.25,
-                'regime': 0.15,
-                'sentiment': 0.10
+                'lgbm': 0.25, 'tabnet': 0.25, 'meta': 0.25, 'regime': 0.15, 'sentiment': 0.10
             },
             'volatile': {
-                'lgbm': 0.40,
-                'meta': 0.35,
-                'regime': 0.15,
-                'sentiment': 0.10
+                'lgbm': 0.20, 'tabnet': 0.20, 'meta': 0.35, 'regime': 0.15, 'sentiment': 0.10
             },
             'crisis': {
-                'lgbm': 0.30,
-                'meta': 0.45,
-                'regime': 0.15,
-                'sentiment': 0.10
+                'lgbm': 0.15, 'tabnet': 0.15, 'meta': 0.45, 'regime': 0.15, 'sentiment': 0.10
             },
             'unknown': {
-                'lgbm': 0.50,
-                'meta': 0.30,
-                'regime': 0.10,
-                'sentiment': 0.10
+                'lgbm': 0.25, 'tabnet': 0.25, 'meta': 0.30, 'regime': 0.10, 'sentiment': 0.10
             }
         }
         
@@ -69,11 +54,11 @@ class EnsembleScorer:
         """Returns the default weights (for 'unknown' regime) for backward compatibility"""
         return self.regime_weights['unknown']
 
-    def compute_score(self, lgbm_prob: float, meta_prob: float = 0.5,
+    def compute_score(self, lgbm_prob: float, tabnet_prob: float = 0.5, meta_prob: float = 0.5,
                       sentiment_score: float = 0.0, regime_score: float = 0.5,
                       meta_gate: float = 0.0, regime: str = 'unknown', symbol: str = 'unknown') -> float:
         """
-        Calculate weighted ensemble score from lgbm + meta + regime + sentiment.
+        Calculate weighted ensemble score from lgbm + tabnet + meta + regime + sentiment.
         Uses regime-conditional weights based on the current market regime.
         Raw probabilities are used directly (already Isotonic-calibrated upstream).
         
@@ -82,15 +67,13 @@ class EnsembleScorer:
           < short_threshold → short signal
           between           → no trade
         """
-        if meta_prob < meta_gate:
-            return 0.5
-        
         sentiment_normalized = (sentiment_score + 1.0) / 2.0
         
         w = self.regime_weights.get(regime, self.regime_weights['unknown'])
         
         score = (
             lgbm_prob * w['lgbm'] +
+            tabnet_prob * w['tabnet'] +
             meta_prob * w['meta'] +
             regime_score * w['regime'] +
             sentiment_normalized * w['sentiment']

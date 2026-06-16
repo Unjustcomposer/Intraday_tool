@@ -61,9 +61,9 @@ def fetch_india_vix() -> float:
     return 15.0  # Conservative fallback
 
 
-def fetch_stock_data(symbols: list, days: int = 59) -> dict:
-    """Fetch historical 15-min bar data for NSE stocks via yfinance."""
-    engine = MarketDataEngine()
+def fetch_stock_data(symbols: list, days: int = 59, broker=None) -> dict:
+    """Fetch historical 15-min bar data for NSE stocks via Broker API (or yfinance fallback)."""
+    engine = MarketDataEngine(broker_client=broker)
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days)
     
@@ -71,7 +71,8 @@ def fetch_stock_data(symbols: list, days: int = 59) -> dict:
     for symbol in symbols:
         logger.info(f"Fetching {days} days of 15-min data for {symbol}...")
         try:
-            df = engine.fetch_historical_data(symbol, start_date, end_date, interval='15minute')
+            # Use fetch_intraday_data so it automatically uses broker if available
+            df = engine.fetch_intraday_data(symbol, start_date, end_date, interval='15minute')
             if not df.empty:
                 all_data[symbol] = df
                 logger.info(f"  {symbol}: {len(df)} bars loaded")
@@ -83,10 +84,10 @@ def fetch_stock_data(symbols: list, days: int = 59) -> dict:
     return all_data
 
 
-def run_pipeline(symbol: str, df: pd.DataFrame, config: dict,
-                 india_vix: float = 15.0, news_engine=None) -> list:
+def run_pipeline(symbol: str, df: pd.DataFrame, config: dict, 
+                 india_vix: float = 15.0, news_engine=None, broker=None, call_gen=None) -> list:
     """
-    Run the full ML pipeline on a single stock:
+    Run the end-to-end ML + Microstructure + NLP pipeline for a single symbol.
       1. Feature engineering
       2. Label generation
       3. Train ensemble (LGBM + XGBoost + Meta-Labeler)
@@ -107,31 +108,75 @@ def run_pipeline(symbol: str, df: pd.DataFrame, config: dict,
         logger.warning(f"  {symbol}: Insufficient data ({len(features_df)} bars). Skipping.")
         return []
     
-    # --- 2. Label Generation (Triple Barrier) ---
+    # --- 1b. Stock Quality Gate ---
+    last_close = features_df['close'].iloc[-1]
+    
+    # Estimate DAILY volume from 15-min bars (sum last ~25 bars = 1 trading day)
+    if 'volume' in features_df.columns:
+        bars_per_day = 25  # ~6.25 hrs / 15 min
+        recent_vol = features_df['volume'].iloc[-bars_per_day * 3:]  # Last 3 days
+        if len(recent_vol) >= bars_per_day:
+            # Sum bars into daily chunks and take the average
+            n_full_days = len(recent_vol) // bars_per_day
+            daily_vols = [recent_vol.iloc[i*bars_per_day:(i+1)*bars_per_day].sum() 
+                          for i in range(n_full_days)]
+            avg_daily_volume = sum(daily_vols) / len(daily_vols) if daily_vols else 0
+        else:
+            avg_daily_volume = recent_vol.sum()  # Less than 1 day of data
+    else:
+        avg_daily_volume = 0
+    
+    if last_close < 50:
+        logger.warning(f"  {symbol}: Price ₹{last_close:.2f} below ₹50 minimum. Skipping penny stock.")
+        return []
+    if avg_daily_volume < 200_000 and avg_daily_volume > 0:
+        logger.warning(f"  {symbol}: Est. daily volume {avg_daily_volume:,.0f} below 200K minimum. Skipping illiquid stock.")
+        return []
+    
+    # --- 2. Label Generation (SYMMETRIC Triple Barrier) ---
+    # Uses symmetric barriers so that label=1 (bullish) and label=0 (bearish)
+    # have equal requirements. This prevents the old asymmetric bias where
+    # 75%+ of labels were 0, causing the model to default to bearish predictions.
     close = features_df['close'].values
     atr_series = compute_atr(features_df)
     
-    # Forward return label: 1 if price goes up by > 0.5*ATR before going down 0.5*ATR
+    horizon = 25  # 25 bars forward (~6 hours of 15-min bars)
+    atr_mult = 1.0  # Symmetric: same multiplier for up and down
     labels = []
-    for i in range(len(close) - 1):
-        future_returns = (close[i+1:min(i+26, len(close))] - close[i]) / close[i]
-        if len(future_returns) == 0:
-            labels.append(0)
+    for i in range(len(close)):
+        if i + horizon >= len(close) or np.isnan(atr_series.iloc[i]) or atr_series.iloc[i] <= 0:
+            labels.append(-1)  # Mark as "unlabeled" (will be filtered out)
             continue
-        max_up = future_returns.max()
-        max_down = future_returns.min()
-        atr_pct = atr_series.iloc[i] / close[i] if close[i] > 0 and not np.isnan(atr_series.iloc[i]) else 0.01
         
-        if max_up > 0.5 * atr_pct and max_up > abs(max_down):
-            labels.append(1)  # Bullish
-        elif abs(max_down) > 0.5 * atr_pct and abs(max_down) > max_up:
-            labels.append(0)  # Bearish
-        else:
-            labels.append(0)  # Neutral → bearish bucket
-    labels.append(0)  # Last bar has no forward data
+        current_atr = atr_series.iloc[i]
+        target_up = close[i] + atr_mult * current_atr
+        target_down = close[i] - atr_mult * current_atr
+        
+        label = -1  # Neutral (neither barrier hit)
+        for j in range(i + 1, min(i + 1 + horizon, len(close))):
+            if close[j] >= target_up:
+                label = 1  # Bullish: hit upper barrier first
+                break
+            elif close[j] <= target_down:
+                label = 0  # Bearish: hit lower barrier first
+                break
+        labels.append(label)
     
-    features_df['label'] = labels
+    features_df['label_raw'] = labels
     features_df['atr'] = atr_series
+    
+    # Filter out neutral/unlabeled bars (label=-1) from training
+    labeled_mask = features_df['label_raw'] >= 0
+    labeled_df = features_df[labeled_mask].copy()
+    labeled_df['label'] = labeled_df['label_raw'].astype(int)
+    
+    if len(labeled_df) < 100:
+        logger.warning(f"  {symbol}: Only {len(labeled_df)} labeled bars after filtering neutrals. Skipping.")
+        return []
+    
+    pos_rate = labeled_df['label'].mean()
+    logger.info(f"  {symbol}: Label distribution — {pos_rate:.1%} bullish, {1-pos_rate:.1%} bearish ({len(labeled_df)} labeled bars)")
+    features_df = labeled_df
     
     # --- 3. Train/Val Split with PURGE GAP (prevents forward label leakage) ---
     split_idx = int(len(features_df) * 0.70)
@@ -144,7 +189,7 @@ def run_pipeline(symbol: str, df: pd.DataFrame, config: dict,
         return []
     
     # Feature columns (exclude metadata)
-    exclude_cols = ['label', 'symbol', 'timestamp', 'open', 'high', 'low', 'close',
+    exclude_cols = ['label', 'label_raw', 'symbol', 'timestamp', 'open', 'high', 'low', 'close',
                     'volume', 'vwap', 'bid_price', 'ask_price', 'bid_volume',
                     'ask_volume', 'oi', 'spread', 'trade_count', 'aggressor_side',
                     'buy_volume', 'sell_volume', 'options_pcr', 'options_max_pain',
@@ -168,9 +213,27 @@ def run_pipeline(symbol: str, df: pd.DataFrame, config: dict,
     lgbm.train(X_train, pd.Series(y_train))
     lgbm_probs = lgbm.predict_proba(X_val)
     
-    # XGBoost
-    xgb = XGBoostAlphaModel()
-    xgb.train(X_train, pd.Series(y_train))
+    # TabNet (Deep Neural Network) to decorrelate the ensemble
+    tabnet_probs = np.full(len(X_val), 0.5)
+    try:
+        from models.tabnet_model import TabNetModel
+        tabnet = TabNetModel(model_type='classifier')
+        # TabNet requires NumPy arrays and is highly sensitive to extreme scales
+        X_tr_np = X_train.values.astype(np.float32)
+        y_tr_np = y_train.astype(np.int64)
+        X_va_np = X_val.values.astype(np.float32)
+        y_va_np = y_val.astype(np.int64)
+        
+        # Fast training limits for intraday generation loops
+        tabnet.fit(X_train=X_tr_np, y_train=y_tr_np, X_valid=X_va_np, y_valid=y_va_np, 
+                   max_epochs=20, patience=5)
+        
+        # Extract bullish probability
+        tabnet_preds = tabnet.predict_proba(X_va_np)
+        if tabnet_preds.shape[1] > 1:
+            tabnet_probs = tabnet_preds[:, 1]
+    except Exception as e:
+        logger.warning(f"  {symbol}: TabNet training failed: {e}. Falling back to 0.5 prob.")
     
     # Meta-Labeler: Use out-of-fold predictions to avoid feeding overfit predictions
     meta = MetaLabeler()
@@ -210,10 +273,15 @@ def run_pipeline(symbol: str, df: pd.DataFrame, config: dict,
     live_sentiment = 0.0
     if news_engine:
         live_sentiment = news_engine.compute_sentiment(symbol)
+        
+    # True Level 2 Order Flow Imbalance (OFI) has been moved to execution_engine.py
+    # to be evaluated at the exact microsecond the price hits the entry level.
     
     # --- 5. Generate Signals on Latest Bars ---
     ensemble = EnsembleScorer()
-    call_gen = CallGenerator(min_risk_reward=1.5, min_confidence=0.55)
+    if call_gen is None:
+        from signals.call_generator import CallGenerator
+        call_gen = CallGenerator(min_risk_reward=1.2, min_confidence=0.40, no_new_calls_after="15:30")
     
     # Get conformal threshold from meta-labeler
     conformal_threshold = meta.conformal_threshold if hasattr(meta, 'conformal_threshold') else 0.5
@@ -232,6 +300,7 @@ def run_pipeline(symbol: str, df: pd.DataFrame, config: dict,
         
         score = ensemble.compute_score(
             lgbm_prob=lgbm_probs[i],
+            tabnet_prob=tabnet_probs[i],
             meta_prob=meta_probs[i],
             sentiment_score=live_sentiment,
             regime_score=0.5,
@@ -247,6 +316,7 @@ def run_pipeline(symbol: str, df: pd.DataFrame, config: dict,
             conformal_threshold=conformal_threshold
         )
         
+        # Microstructure Veto (Iceberg detection) has been moved to execution_engine.py
         if signal in ('buy', 'sell'):
             current_close = val_df['close'].iloc[i]
             current_atr = val_df['atr'].iloc[i] if not np.isnan(val_df['atr'].iloc[i]) else current_close * 0.015
@@ -293,8 +363,8 @@ def run_pipeline(symbol: str, df: pd.DataFrame, config: dict,
             )
             
             if call is not None:
-                calls.append(call)
-                print(call_gen.format_call(call))
+                # Deduplicate: Keep only the latest valid call for this symbol
+                calls = [call]
     
     return calls
 
@@ -325,8 +395,22 @@ def main():
     print(f"  Minimum Risk:Reward = 1:1.5")
     print("=" * 60)
     
+    # --- Initialize Fyers Broker for Direct NSE Feeds & WebSockets ---
+    fyers_broker = None
+    if os.environ.get("FYERS_CLIENT_ID") and os.environ.get("FYERS_ACCESS_TOKEN"):
+        try:
+            from data.fyers_client import FyersBroker
+            fyers_broker = FyersBroker(
+                client_id=os.environ.get("FYERS_CLIENT_ID"),
+                secret_key=os.environ.get("FYERS_SECRET_KEY", "")
+            )
+        except Exception as e:
+            logger.warning(f"Could not init FyersBroker: {e}")
+    else:
+        logger.warning("Fyers credentials missing. Will fall back to delayed yfinance data.")
+        
     # --- Fetch Data ---
-    all_data = fetch_stock_data(symbols, days=args.days)
+    all_data = fetch_stock_data(symbols, days=args.days, broker=fyers_broker)
     
     if not all_data:
         logger.error("No data fetched for any symbol. Exiting.")
@@ -334,14 +418,16 @@ def main():
     
     logger.info(f"\nSuccessfully fetched data for {len(all_data)}/{len(symbols)} symbols.")
     
+    # Fyers Websocket connection moved to execution_engine.py
+    
     # --- Process Each Stock ---
     all_calls = []
-    call_gen = CallGenerator(min_risk_reward=1.5, min_confidence=0.55)
+    call_gen = CallGenerator(min_risk_reward=1.2, min_confidence=0.40, no_new_calls_after="15:30")
     news_engine = NewsSentimentEngine(hours_lookback=24)
     
     for symbol, df in all_data.items():
         try:
-            calls = run_pipeline(symbol, df, config, india_vix=india_vix, news_engine=news_engine)
+            calls = run_pipeline(symbol, df, config, india_vix=india_vix, news_engine=news_engine, broker=fyers_broker, call_gen=call_gen)
             all_calls.extend(calls)
         except Exception as e:
             logger.error(f"Pipeline failed for {symbol}: {e}")
@@ -351,12 +437,22 @@ def main():
     
     # --- Summary ---
     call_gen.calls_today = all_calls
+    
+    if all_calls:
+        print("\n" + "=" * 60)
+        print("  FINAL TRADE CALLS")
+        print("=" * 60)
+        for call in all_calls:
+            print(call_gen.format_call(call))
+            
     print(call_gen.get_summary())
     
     # --- Export to CSV ---
     if all_calls:
         calls_df = call_gen.to_dataframe()
-        output_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), args.output)
+        output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, 'pending_orders.csv')
         calls_df.to_csv(output_path, index=False)
         logger.info(f"\nCalls exported to: {output_path}")
     else:
