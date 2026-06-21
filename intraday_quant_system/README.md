@@ -1,100 +1,168 @@
-# Institutional-Grade Intraday Quant System (NSE)
+# Intraday_tool
 
-![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)
-![Machine Learning](https://img.shields.io/badge/ML-LightGBM%20%7C%20XGBoost%20%7C%20CatBoost-orange)
+**Autonomous intraday quantitative trading framework for the NSE.**
+
+![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
-
-An institutional-grade, fully autonomous quantitative trading framework designed for the Indian Stock Market (NSE). Unlike basic retail bots that rely on simple moving averages, this system implements advanced hedge-fund methodologies including **Meta-Labeling**, **Purged Walk-Forward Cross Validation**, **VWAP Execution Algorithms**, and a **Headless Broker Auto-Login**.
-
----
-
-## 🚀 Key Features
-
-* **Advanced Machine Learning Ensemble:** Utilizes a primary ensemble of `LightGBM` and `XGBoost` classifiers trained on high-fidelity features (Order Flow Imbalance, VPIN, Micro-price Volatility) to detect intraday alpha.
-* **CatBoost Meta-Labeler & Conformal Prediction:** Instead of blindly trusting the primary model, a secondary `CatBoost` meta-labeler predicts the *probability of success* of the primary signal. It uses conformal prediction bands to dynamically gate trades based on market regime and uncertainty, effectively filtering out 99% of market noise.
-* **Algorithmic Execution (OMS):** Features a robust Order Management System (OMS) utilizing a VWAP (Volume-Weighted Average Price) algorithm. Large institutional-sized orders are intelligently sliced into child orders based on historical intraday U-shaped volume curves to minimize market impact and slippage.
-* **Headless Broker Integration:** Fully automated `fyers-apiv3` integration. The system programmatically generates its own TOTP codes (`pyotp`) and bypasses the manual daily OAuth web-login flow, allowing the daemon to run 100% autonomously.
-* **Dynamic Pre-Market Screener:** Uses highly parallelized data fetching to scan the entire F&O universe at 09:15 AM, automatically identifying the top "Stocks in Play" based on pre-market gap momentum and relative volume.
-* **Institutional Risk Management:** Hardcoded Risk:Reward gating, India VIX volatility filters, and API circuit breakers ensure capital preservation in destructive market conditions.
+![Status: Active](https://img.shields.io/badge/Status-Active-brightgreen)
+![Platform: NSE](https://img.shields.io/badge/Platform-NSE%20India-orange)
 
 ---
 
-## 🧠 System Architecture
+## Overview
 
-```mermaid
-graph TD
-    A[Dynamic Screener] -->|Top Momentum Stocks| B(Market Data Engine)
-    B -->|OHLCV & Tick Data| C{Feature Store}
-    
-    subgraph Machine Learning Pipeline
-    C -->|Micro-structure Features| D[Primary Ensemble]
-    D -.->|Base Signal| E(CatBoost Meta-Labeler)
-    E -->|Confidence Score| F[Call Generator]
-    end
-    
-    F -->|Risk:Reward Filter| G[Order Management System]
-    
-    subgraph Execution
-    G -->|Large Order| H(VWAP Slicer)
-    H -->|Child Orders| I[Fyers Broker Client]
-    I -->|Live Market| J((NSE))
-    end
+An institutional-grade intraday trading system for India's National Stock Exchange, built entirely in Python. It runs as **two decoupled processes** — an ML signal engine that generates trade calls offline, and a separate execution engine that monitors Level 2 order book depth in real time — so a broker WebSocket failure never crashes model training and vice versa. Built for quantitative traders and ML engineers who want a production-grade reference implementation, not a toy backtest.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PROCESS 1: ML SIGNAL ENGINE                  │
+│                    (scripts/generate_calls.py)                  │
+│                                                                 │
+│  ┌──────────┐   ┌──────────────┐   ┌───────────────────────┐   │
+│  │ STAGE 1  │   │   STAGE 2    │   │       STAGE 3         │   │
+│  │ Screener │──▶│ ML Ensemble  │──▶│   11-Filter Cascade   │   │
+│  │          │   │              │   │                       │   │
+│  │ F&O scan │   │ LightGBM    │   │ Meta-labeler gate     │   │
+│  │ ≥₹50     │   │ TabNet      │   │ VIX kill switch       │   │
+│  │ ADV≥200K │   │ CatBoost    │   │ R:R ≥ 2.0            │   │
+│  │          │   │ Meta-Labeler│   │ Min margin 0.75%      │   │
+│  └──────────┘   └──────────────┘   │ Max SL 1.5%          │   │
+│                                     │ Portfolio exposure    │   │
+│                                     └───────────┬───────────┘   │
+└─────────────────────────────────────────────────┼───────────────┘
+                                                  │
+                                          approved_calls.csv
+                                                  │
+               ═══════════════════════════════════╪═══════════════
+                        DECOUPLING BOUNDARY       │
+               ═══════════════════════════════════╪═══════════════
+                                                  │
+┌─────────────────────────────────────────────────┼───────────────┐
+│                  PROCESS 2: EXECUTION ENGINE                    │
+│                  (scripts/execution_engine.py)                  │
+│                                                                 │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐    │
+│  │   STAGE 4    │   │  OFI Check   │   │  Fyers Broker    │    │
+│  │ L2 WebSocket │──▶│  Iceberg     │──▶│  Order Placement │    │
+│  │ Depth Monitor│   │  Detection   │   │  INTRADAY mode   │    │
+│  └──────────────┘   └──────────────┘   └──────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🛠️ Installation
+## Key Results
 
-### Prerequisites
-* Python 3.10+
-* Microsoft Visual C++ Build Tools (Required for `aiohttp` on Windows)
-* An active Fyers Trading Account (for live execution)
-
-### Setup
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/intraday-quant-system.git
-   cd intraday-quant-system
-   ```
-
-2. Create and activate a virtual environment:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
-   ```
-
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Configure Environment Variables:
-   Create a `.env` file in the root directory and add your Fyers credentials:
-   ```ini
-   FYERS_APP_ID="YOUR_APP_ID-100"
-   FYERS_SECRET_KEY="YOUR_SECRET_KEY"
-   FYERS_CLIENT_ID="YOUR_FY_ID"
-   FYERS_TOTP_SECRET="YOUR_32_CHAR_BASE32_SECRET"
-   FYERS_PIN="1234"
-   ```
+| Metric | Value |
+|---|---|
+| Out-of-sample AUC (LightGBM) | **0.556** |
+| Signal filter rate | **~99%** of raw signals rejected |
+| Position sizing | Half-Kelly, capped at 10% per trade |
+| Max drawdown limit | 10% → full shutdown |
+| Daily / Weekly loss limit | 3% / 6% |
+| VIX kill switches | Caution at 25, full block at 30 |
+| Broker integration | Fyers V3, headless TOTP login |
+| Calibration method | Isotonic → Spearman ρ check → Platt fallback |
 
 ---
 
-## 💻 Usage
+## Tech Stack
 
-### 1. Live Trading Daemon (Production)
-Run the headless live trading daemon. This will automatically authenticate, run the dynamic screener, and enter the live execution tick loop:
+| Category | Tools |
+|---|---|
+| ML Models | LightGBM, PyTorch TabNet, CatBoost (meta-labeler), Scikit-learn |
+| Features | VPIN, Kyle's Lambda, Amihud illiquidity, OFI, Garman-Klass vol, Hurst exponent |
+| Execution | Fyers V3 WebSocket, Level 2 depth, OFI-based iceberg detection |
+| Data | Pandas, NumPy, yfinance, Parquet storage |
+| Risk | Half-Kelly sizing, India VIX filters, conformal prediction thresholds |
+| Regime | Gaussian Mixture Model (3-state: quiet / trending / volatile + crisis override) |
+
+---
+
+## Installation
+
 ```bash
-python -m scripts.live_trader --top-n 10
+# Clone
+git clone https://github.com/Unjustcomposer/Intraday_tool.git
+cd Intraday_tool/intraday_quant_system
+
+# Virtual environment
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate   # Linux/Mac
+
+# Dependencies
+pip install -r requirements.txt
 ```
 
-### 2. Manual Call Generation (Testing)
-Run the core ML pipeline to generate trade calls for the top 5 momentum stocks using the `yfinance` fallback engine (useful for testing without live broker execution):
+Configure `.env` in the project root:
+
+```ini
+FYERS_CLIENT_ID=YOUR_APP_ID-200
+FYERS_SECRET_KEY=YOUR_SECRET
+FYERS_ACCESS_TOKEN=               # Generated daily via auth.py
+```
+
+Run the system:
+
 ```bash
-python -m scripts.generate_calls --dynamic-screener --top-n 5
+# Step 1: Generate ML signals
+python -m scripts.generate_calls --symbols RELIANCE.NS HDFCBANK.NS --days 60
+
+# Step 2: Launch execution engine (separate process)
+python scripts/execution_engine.py
 ```
 
 ---
 
-## ⚠️ Disclaimer
-This software is for educational and research purposes only. Do not risk money which you are afraid to lose. USE AS AT YOUR OWN RISK. The authors assume no responsibility for your trading results.
+## Project Structure
+
+```
+intraday_quant_system/
+├── scripts/
+│   ├── generate_calls.py        # ML signal engine (Process 1)
+│   ├── execution_engine.py      # Execution daemon  (Process 2)
+│   ├── simulate_historical.py   # Historical walk-forward simulation
+│   └── run_full_backtest.py     # Full backtest with Monte Carlo
+├── models/
+│   ├── lgbm_model.py            # LightGBM with purged CV + isotonic calibration
+│   ├── tabnet_model.py          # PyTorch TabNet (decorrelated ensemble member)
+│   └── catboost_meta_labeler.py # Meta-labeler with conformal prediction
+├── signals/
+│   ├── ensemble.py              # Regime-conditional weighted scoring
+│   └── call_generator.py        # Trade call generation + 11-filter cascade
+├── features/
+│   ├── feature_store.py         # 22+ microstructure & volatility features
+│   ├── microstructure.py        # VPIN, trade sign correlation
+│   └── volatility_features.py   # ATR, Garman-Klass, realized vol
+├── data/
+│   ├── market_data.py           # yfinance + Fyers data engine
+│   └── fyers_client.py          # Broker client, WebSocket, L2 cache, OFI
+├── regime/
+│   └── hmm_regime.py            # GMM-based regime detection (3-state + crisis)
+├── deployment/
+│   └── config.py                # Transaction costs, risk limits, timing (Pydantic)
+└── .env                         # Credentials (gitignored)
+```
+
+---
+
+## What's Next
+
+- **Options pricing:** Black-Scholes integration for NSE F&O, Greeks-based hedging
+- **Event-driven architecture:** Redis pub/sub replacing CSV handoff between processes
+- **Live paper trading:** Real-time P&L dashboard with fill tracking and slippage measurement
+
+---
+
+## Disclaimer
+
+This software is for educational and research purposes only. Do not risk money you cannot afford to lose. Use at your own risk. The author assumes no responsibility for trading results.
+
+---
+
+Built by **Harshit Khandelwal** · [LinkedIn](https://linkedin.com/in/YOUR_LINKEDIN) · [Read the full breakdown on Medium](https://medium.com/@YOUR_HANDLE)
