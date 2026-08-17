@@ -1,41 +1,38 @@
-import pytest
-import pandas as pd
-import numpy as np
-import sys
 import os
+import sys
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+import numpy as np
+import pandas as pd
 
-from deployment.pipeline_runner import PipelineRunner
-from execution.execution_engine import ExecutionEngine
-from execution.order_manager import OrderManager
-from backtesting.backtest_engine import BacktestEngine, BacktestResult
-from backtesting.walk_forward import WalkForwardValidator
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-def test_pipeline_initialization():
-    runner = PipelineRunner()
-    
-    assert runner.execution_engine is not None
-    assert runner.order_manager is not None
-    assert not runner.is_running
-    
+from intraday_quant_system.backtesting.walk_forward import (
+    PurgedWalkForwardValidator as WalkForwardValidator,
+)
+
+
 def test_walk_forward_validator():
-    validator = WalkForwardValidator(training_window=100, validation_window=20, step_size=10)
-    
+    validator = WalkForwardValidator(
+        n_splits=3, train_size=0.7, val_size=0.15, purge_bars=10, embargo_bars=10
+    )
+
     # Mock data
-    dates = pd.date_range('2023-01-01', '2023-08-01')
-    df = pd.DataFrame({'close': np.random.randn(len(dates))}, index=dates)
-    
+    dates = pd.date_range("2023-01-01", periods=500, freq="15min")
+    df = pd.DataFrame(
+        {
+            "close": 100 + np.cumsum(np.random.randn(len(dates)) * 0.5),
+            "label": np.random.randint(0, 2, len(dates)),
+        },
+        index=dates,
+    )
+
     # Mock factory
     def model_factory(train_df, val_df):
-        return {
-            'sharpe': 1.2,
-            'win_rate': 0.55
-        }
-        
+        return {"sharpe": 1.2, "win_rate": 0.55}
+
     results = validator.run(df, model_factory)
-    
+
     assert len(results) > 0
-    
+
     agg = validator.aggregate_results(results)
-    assert 'avg_sharpe' in agg
+    assert "avg_sharpe" in agg

@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/672684679970642744/fb9e6711119a438bb2898f9972dc99a7/artifacts
+end_time: 1786639751126
+entry_point_name: ''
+experiment_id: '672684679970642744'
+lifecycle_stage: active
+run_id: fb9e6711119a438bb2898f9972dc99a7
+run_name: worried-gnu-673
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1786639748674
+status: 3
+tags: []
+user_id: khand

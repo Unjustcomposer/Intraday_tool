@@ -1,10 +1,11 @@
 import os
-from typing import List, Dict, Any
-from pydantic import BaseModel, Field
+
 import yaml
+from pydantic import BaseModel, Field
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass  # python-dotenv not installed; env vars must be set externally
@@ -12,6 +13,7 @@ except ImportError:
 
 class TransactionCosts(BaseModel):
     """Indian market transaction cost model (NSE equity intraday)"""
+
     brokerage_pct: float = 0.0003
     stt_sell_pct: float = 0.00025
     exchange_txn_pct: float = 0.0000345
@@ -19,7 +21,7 @@ class TransactionCosts(BaseModel):
     sebi_turnover_pct: float = 0.000001
     stamp_duty_buy_pct: float = 0.00003
     estimated_slippage_pct: float = 0.0002
-    
+
     def total_cost_buy(self, turnover: float) -> float:
         """Total cost for a buy trade"""
         brokerage = min(turnover * self.brokerage_pct, 20.0)  # Zerodha ₹20 cap
@@ -29,7 +31,7 @@ class TransactionCosts(BaseModel):
         stamp = turnover * self.stamp_duty_buy_pct
         slippage = turnover * self.estimated_slippage_pct
         return brokerage + exchange + gst + sebi + stamp + slippage
-    
+
     def total_cost_sell(self, turnover: float) -> float:
         """Total cost for a sell trade"""
         brokerage = min(turnover * self.brokerage_pct, 20.0)
@@ -39,7 +41,7 @@ class TransactionCosts(BaseModel):
         sebi = turnover * self.sebi_turnover_pct
         slippage = turnover * self.estimated_slippage_pct
         return brokerage + stt + exchange + gst + sebi + slippage
-    
+
     def total_round_trip_pct(self, turnover: float = 100000.0) -> float:
         """Total round-trip cost as percentage for a given turnover.
         Uses actual ₹20 brokerage cap like the individual cost methods."""
@@ -50,6 +52,7 @@ class TransactionCosts(BaseModel):
 
 class SuccessMetrics(BaseModel):
     """Minimum thresholds for production go-live"""
+
     min_sharpe_ratio: float = 1.0
     max_drawdown_pct: float = 0.10
     min_win_rate: float = 0.50
@@ -59,6 +62,7 @@ class SuccessMetrics(BaseModel):
 
 class RiskConfig(BaseModel):
     """Risk management parameters"""
+
     max_risk_per_trade: float = 0.02
     max_open_positions: int = 5
     max_sector_exposure: float = 0.25
@@ -72,6 +76,7 @@ class RiskConfig(BaseModel):
 
 class IntradayTiming(BaseModel):
     """Intraday session parameters for NSE"""
+
     bars_per_day: int = 72  # 9:15 to 15:15 = 360min / 5min = 72 bars
     bars_per_year: int = 18144  # 72 * 252
     no_new_trades_after: str = "14:30"
@@ -105,98 +110,122 @@ class TransformerConfig(BaseModel):
     epochs: int = 100
     patience: int = 10
 
+class PaperTradingValidationConfig(BaseModel):
+    min_paper_trading_days: int = 10
+    min_win_rate: float = 0.55
+    min_net_profit_factor: float = 1.25
+    max_paper_drawdown: float = 0.05
 
 class ModelsConfig(BaseModel):
     lgbm: LGBMConfig = Field(default_factory=LGBMConfig)
     catboost: CatBoostConfig = Field(default_factory=CatBoostConfig)
     transformer: TransformerConfig = Field(default_factory=TransformerConfig)
-
-
+    
 class QuantConfig(BaseModel):
     zerodha_api_key: str = Field(default_factory=lambda: os.getenv("KITE_API_KEY", ""))
-    zerodha_api_secret: str = Field(default_factory=lambda: os.getenv("KITE_API_SECRET", ""))
-    timescaledb_url: str = Field(default_factory=lambda: os.getenv("TIMESCALEDB_URL", ""))
-    redis_url: str = Field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-    universe: List[str] = Field(default_factory=list)
+    zerodha_api_secret: str = Field(
+        default_factory=lambda: os.getenv("KITE_API_SECRET", "")
+    )
+    timescaledb_url: str = Field(
+        default_factory=lambda: os.getenv("TIMESCALEDB_URL", "")
+    )
+    redis_url: str = Field(
+        default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    )
+    universe: list[str] = Field(default_factory=list)
     target_volatility: float = 0.15
     max_capital: float = 1000000.0
     trading_start: str = "09:15"
     trading_end: str = "15:15"
     retraining_frequency: str = "weekly"
-    
+
     # Sub-configs
     transaction_costs: TransactionCosts = Field(default_factory=TransactionCosts)
     success_metrics: SuccessMetrics = Field(default_factory=SuccessMetrics)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     intraday: IntradayTiming = Field(default_factory=IntradayTiming)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    paper_trading: PaperTradingValidationConfig = Field(default_factory=PaperTradingValidationConfig)
 
     @classmethod
     def load_from_yaml(cls, yaml_path: str) -> "QuantConfig":
         """Load configuration from a YAML file."""
         if not os.path.exists(yaml_path):
             raise FileNotFoundError(f"Config file not found at {yaml_path}")
-            
-        with open(yaml_path, 'r') as f:
+
+        with open(yaml_path) as f:
             yaml_data = yaml.safe_load(f) or {}
-            
+
         config_dict = {}
-        
+
         # Extract trading config
-        if 'trading' in yaml_data:
-            trading = yaml_data['trading']
-            for key in ['universe', 'target_volatility', 'max_capital', 'trading_start', 'trading_end', 'retraining_frequency']:
+        if "trading" in yaml_data:
+            trading = yaml_data["trading"]
+            for key in [
+                "universe",
+                "target_volatility",
+                "max_capital",
+                "trading_start",
+                "trading_end",
+                "retraining_frequency",
+            ]:
                 if key in trading:
                     config_dict[key] = trading[key]
-                    
+
         # Extract zerodha config
-        if 'zerodha' in yaml_data:
-            z = yaml_data['zerodha']
-            if not os.getenv("KITE_API_KEY") and 'api_key' in z:
-                val = z['api_key']
-                if not val.startswith('${'):
-                    config_dict['zerodha_api_key'] = val
-            if not os.getenv("KITE_API_SECRET") and 'api_secret' in z:
-                val = z['api_secret']
-                if not val.startswith('${'):
-                    config_dict['zerodha_api_secret'] = val
-                    
+        if "zerodha" in yaml_data:
+            z = yaml_data["zerodha"]
+            if not os.getenv("KITE_API_KEY") and "api_key" in z:
+                val = z["api_key"]
+                if not val.startswith("${"):
+                    config_dict["zerodha_api_key"] = val
+            if not os.getenv("KITE_API_SECRET") and "api_secret" in z:
+                val = z["api_secret"]
+                if not val.startswith("${"):
+                    config_dict["zerodha_api_secret"] = val
+
         # Database fallback to yaml if not in env
-        if 'database' in yaml_data:
-            db = yaml_data['database']
-            if not os.getenv("TIMESCALEDB_URL") and 'timescaledb_url' in db:
-                val = db['timescaledb_url']
-                if not val.startswith('${'):
-                    config_dict['timescaledb_url'] = val
-            if not os.getenv("REDIS_URL") and 'redis_url' in db:
-                val = db['redis_url']
-                if not val.startswith('${'):
-                    config_dict['redis_url'] = val
-                    
+        if "database" in yaml_data:
+            db = yaml_data["database"]
+            if not os.getenv("TIMESCALEDB_URL") and "timescaledb_url" in db:
+                val = db["timescaledb_url"]
+                if not val.startswith("${"):
+                    config_dict["timescaledb_url"] = val
+            if not os.getenv("REDIS_URL") and "redis_url" in db:
+                val = db["redis_url"]
+                if not val.startswith("${"):
+                    config_dict["redis_url"] = val
+
         # Transaction costs
-        if 'transaction_costs' in yaml_data:
-            config_dict['transaction_costs'] = TransactionCosts(**yaml_data['transaction_costs'])
-        
+        if "transaction_costs" in yaml_data:
+            config_dict["transaction_costs"] = TransactionCosts(
+                **yaml_data["transaction_costs"]
+            )
+
         # Success metrics
-        if 'success_metrics' in yaml_data:
-            config_dict['success_metrics'] = SuccessMetrics(**yaml_data['success_metrics'])
-        
+        if "success_metrics" in yaml_data:
+            config_dict["success_metrics"] = SuccessMetrics(
+                **yaml_data["success_metrics"]
+            )
+
         # Risk config
-        if 'risk' in yaml_data:
-            config_dict['risk'] = RiskConfig(**yaml_data['risk'])
-        
+        if "risk" in yaml_data:
+            config_dict["risk"] = RiskConfig(**yaml_data["risk"])
+
         # Intraday timing
-        if 'intraday' in yaml_data:
-            config_dict['intraday'] = IntradayTiming(**yaml_data['intraday'])
-            
+        if "intraday" in yaml_data:
+            config_dict["intraday"] = IntradayTiming(**yaml_data["intraday"])
+
         # Models config
-        if 'models' in yaml_data:
-            models_data = yaml_data['models']
-            lgbm_cfg = LGBMConfig(**models_data.get('lgbm', {}))
-            cat_cfg = CatBoostConfig(**models_data.get('catboost', {}))
-            trans_cfg = TransformerConfig(**models_data.get('transformer', {}))
-            config_dict['models'] = ModelsConfig(lgbm=lgbm_cfg, catboost=cat_cfg, transformer=trans_cfg)
-                
+        if "models" in yaml_data:
+            models_data = yaml_data["models"]
+            lgbm_cfg = LGBMConfig(**models_data.get("lgbm", {}))
+            cat_cfg = CatBoostConfig(**models_data.get("catboost", {}))
+            trans_cfg = TransformerConfig(**models_data.get("transformer", {}))
+            config_dict["models"] = ModelsConfig(
+                lgbm=lgbm_cfg, catboost=cat_cfg, transformer=trans_cfg
+            )
+
         return cls(**config_dict)
 
 

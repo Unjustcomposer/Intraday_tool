@@ -1,0 +1,8 @@
+artifact_location: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/672684679970642744
+creation_time: 1786637997713
+experiment_id: '672684679970642744'
+last_update_time: 1786637997713
+lifecycle_stage: active
+name: Intraday_Microstructure_Backtest
+trace_location: null
+workspace: default

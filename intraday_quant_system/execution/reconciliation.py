@@ -1,15 +1,17 @@
-import time
 import logging
 import threading
-from typing import Callable, Any
+import time
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
+
 
 class MarginReconciler:
     """
     Background worker that syncs internal state with the live broker margin/positions API.
     Prevents phantom rejections, over-leveraging, and out-of-sync portfolios.
     """
+
     def __init__(self, fetch_margin_func: Callable[[], float], sync_interval: int = 10):
         """
         Args:
@@ -44,7 +46,7 @@ class MarginReconciler:
                 # Future: Could update a centralized Redis state or emit a signal here
             except Exception as e:
                 logger.error(f"Margin reconciliation failed: {e}")
-            
+
             time.sleep(self.sync_interval)
 
     @property

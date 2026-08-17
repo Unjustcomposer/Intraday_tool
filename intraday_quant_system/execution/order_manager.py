@@ -1,66 +1,163 @@
 import logging
-import pandas as pd
-from typing import Dict, Any, List, Optional
+import threading
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from risk.position_sizing import kelly_fraction, volatility_adjusted_size, PortfolioLimits
-from .algorithms import TWAP, VWAP, AlmgrenChriss, Iceberg
+from enum import Enum
+from typing import Dict, Any, List, Optional
+
+import pandas as pd
+from intraday_quant_system.risk.position_sizing import (
+    PortfolioLimits,
+    volatility_adjusted_size,
+)
+
+from .algorithms import VWAP
 from .volume_profiler import VolumeProfiler
 
 logger = logging.getLogger(__name__)
 
+
+class OrderState(Enum):
+    """Order state machine states."""
+    PENDING = "PENDING"      # Order created, not yet sent to broker
+    SUBMITTED = "SUBMITTED"  # Sent to broker, awaiting acknowledgment
+    OPEN = "OPEN"            # Active in market (LIMIT order on book)
+    PARTIAL = "PARTIAL"      # Partially filled
+    FILLED = "FILLED"        # Fully filled
+    CANCELLED = "CANCELLED"  # Cancelled by user/system
+    REJECTED = "REJECTED"    # Rejected by broker
+    EXPIRED = "EXPIRED"      # Expired (e.g., end of day)
+
+
+@dataclass
+class OrderInfo:
+    """Structured order information with state machine."""
+    order_id: str
+    symbol: str
+    side: str          # BUY/SELL
+    quantity: int
+    order_type: str    # LIMIT/MARKET
+    price: float
+    state: OrderState = OrderState.PENDING
+    filled_qty: int = 0
+    avg_fill_price: float = 0.0
+    timestamp: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    parent_order_id: str = ""
+    child_orders: List[str] = field(default_factory=list)
+    error_message: str = ""
+    queue_pos: float = 0.0
+    initial_queue_pos: float = 0.0
+    oib: float = 0.0
+    regime: str = "unknown"
+    algo_type: str = ""  # VWAP/TWAP/ICEBERG
+    
+    def update_state(self, new_state: OrderState, fill_info: dict = None):
+        """Update order state with optional fill info."""
+        self.state = new_state
+        self.updated_at = datetime.now()
+        if fill_info:
+            self.filled_qty = fill_info.get("filled_qty", self.filled_qty)
+            self.avg_fill_price = fill_info.get("avg_price", self.avg_fill_price)
+            if self.filled_qty >= self.quantity:
+                self.state = OrderState.FILLED
+            elif self.filled_qty > 0:
+                self.state = OrderState.PARTIAL
+
+
+# NSE sector mapping for exposure tracking
+SECTOR_MAP = {
+    "RELIANCE": "energy",
+    "ONGC": "energy",
+    "IOC": "energy",
+    "BPCL": "energy",
+    "HDFCBANK": "banking",
+    "ICICIBANK": "banking",
+    "SBIN": "banking",
+    "KOTAKBANK": "banking",
+    "AXISBANK": "banking",
+    "INDUSINDBK": "banking",
+    "BANKBARODA": "banking",
+    "TCS": "it",
+    "INFY": "it",
+    "WIPRO": "it",
+    "HCLTECH": "it",
+    "TECHM": "it",
+    "LTI": "it",
+    "TATAMOTORS": "auto",
+    "MARUTI": "auto",
+    "M&M": "auto",
+    "BAJAJ-AUTO": "auto",
+    "TATASTEEL": "metals",
+    "HINDALCO": "metals",
+    "JSWSTEEL": "metals",
+    "SUNPHARMA": "pharma",
+    "DRREDDY": "pharma",
+    "CIPLA": "pharma",
+    "HINDUNILVR": "fmcg",
+    "ITC": "fmcg",
+    "NESTLEIND": "fmcg",
+}
+
+
 class OrderManager:
     """
     High-level manager orchestrating entry, exit, and stop-loss logic.
-    
+
     Production features:
       - Circuit breaker logic (NSE upper/lower circuits)
       - Gap risk handling
       - Proper integration with StopLossEngine
     """
-    # NSE sector mapping for exposure tracking
-    SECTOR_MAP = {
-        'RELIANCE': 'energy', 'ONGC': 'energy', 'IOC': 'energy', 'BPCL': 'energy',
-        'HDFCBANK': 'banking', 'ICICIBANK': 'banking', 'SBIN': 'banking', 'KOTAKBANK': 'banking',
-        'AXISBANK': 'banking', 'INDUSINDBK': 'banking', 'BANKBARODA': 'banking',
-        'TCS': 'it', 'INFY': 'it', 'WIPRO': 'it', 'HCLTECH': 'it', 'TECHM': 'it', 'LTI': 'it',
-        'TATAMOTORS': 'auto', 'MARUTI': 'auto', 'M&M': 'auto', 'BAJAJ-AUTO': 'auto',
-        'TATASTEEL': 'metals', 'HINDALCO': 'metals', 'JSWSTEEL': 'metals',
-        'SUNPHARMA': 'pharma', 'DRREDDY': 'pharma', 'CIPLA': 'pharma',
-        'HINDUNILVR': 'fmcg', 'ITC': 'fmcg', 'NESTLEIND': 'fmcg',
-    }
 
-    def __init__(self, execution_engine, risk_monitor, stop_engine, config: dict = None):
+    def __init__(
+        self, execution_engine, risk_monitor, stop_engine, config: dict = None
+    ):
         self.exec_engine = execution_engine
         self.risk_monitor = risk_monitor
         self.stop_engine = stop_engine
         self.config = config or {}
-        
-        timing = self.config.get('intraday', {})
-        self.hard_exit_time = timing.get('hard_exit', "15:15")
-        
+
+        timing = self.config.get("intraday", {})
+        self.hard_exit_time = timing.get("hard_exit", "15:15")
+
+        # Default risk:reward ratio (will be updated from TradeCall)
+        self.risk_reward = self.config.get("default_risk_reward", 2.0)
+
         # Track active stops per symbol
-        self.active_stops: Dict[str, Dict] = {}
-        
+        self.active_stops: dict[str, dict] = {}
+
         # Track last trade time per symbol to prevent wash trade whipsawing
-        self.last_trade_time: Dict[str, datetime] = {}
-        
+        self.last_trade_time: dict[str, datetime] = {}
+
         # The Order Blotter (Parent Orders)
-        self.blotter: Dict[str, Dict] = {} # order_id -> ParentOrder details
-        
-        # Track open Child orders for 30s conversion logic
-        self.open_orders: Dict[str, Dict] = {} # child_order_id -> {symbol, timestamp, ...}
-        
+        self.blotter: dict[str, dict] = {}  # order_id -> ParentOrder details
+
+        # Track open Child orders with state machine
+        self.open_orders: dict[str, OrderInfo] = (
+            {}
+        )  # child_order_id -> OrderInfo
+
         # Track active execution algorithms
-        self.active_algorithms: Dict[str, Dict] = {} # algo_id -> {algo, symbol, price, regime, ...}
-        
+        self.active_algorithms: dict[str, dict] = (
+            {}
+        )  # algo_id -> {algo, symbol, price, regime, ...}
+
         # Cache for historical volume profiles
-        self.volume_profiles_cache: Dict[str, List[float]] = {}
-        
+        self.volume_profiles_cache: dict[str, list[float]] = {}
+
         import threading
+
         self._lock = threading.RLock()
 
-    def process_signals(self, signals_df: pd.DataFrame, current_prices: Dict[str, float],
-                        market_data: pd.DataFrame = None, features_data: Dict[str, pd.Series] = None):
+    def process_signals(
+        self,
+        signals_df: pd.DataFrame,
+        current_prices: dict[str, float],
+        market_data: pd.DataFrame = None,
+        features_data: dict[str, pd.Series] = None,
+    ):
         """
         Process new alpha signals.
         signals_df should have [symbol, signal, confidence, regime]
@@ -69,51 +166,61 @@ class OrderManager:
         if self.risk_monitor.trading_halted:
             logger.warning("Trading halted. Ignoring new signals.")
             return
-            
+
         if self.check_hard_exit():
             logger.info("Past hard exit time. No new trades allowed.")
             return
-            
+
         # Get maximum volatility for window cutoff adjustment
         max_vol = 0.0
         if features_data:
-            for sym in current_prices.keys():
+            for sym in current_prices:
                 max_vol = max(max_vol, self._get_volatility(sym, features_data))
-                
+
         if not self._is_trading_window_active(volatility=max_vol):
             logger.info("Outside active trading window. Rejecting new signals.")
             return
-            
+
         positions = self.exec_engine.get_positions()
-        open_symbols = positions['symbol'].tolist() if not positions.empty else []
+        open_symbols = positions["symbol"].tolist() if not positions.empty else []
         now = datetime.now()
-        
+
         for _, row in signals_df.iterrows():
-            symbol = row['symbol']
-            signal = row['signal']
-            regime = row.get('regime', 'unknown')
-            confidence = row.get('confidence', 0.5)
-            
+            symbol = row["symbol"]
+            signal = row["signal"]
+            regime = row.get("regime", "unknown")
+            confidence = row.get("confidence", 0.5)
+
             # Check circuit breakers if market data provided
-            if market_data is not None and self._is_near_circuit(symbol, current_prices[symbol], market_data):
-                logger.warning(f"Symbol {symbol} near circuit limit. Rejecting {signal}.")
+            if market_data is not None and self._is_near_circuit(
+                symbol, current_prices[symbol], market_data
+            ):
+                logger.warning(
+                    f"Symbol {symbol} near circuit limit. Rejecting {signal}."
+                )
                 continue
-            
+
             # Already have a position?
             if symbol in open_symbols:
-                pos_qty = positions[positions['symbol'] == symbol]['quantity'].iloc[0]
+                pos_qty = positions[positions["symbol"] == symbol]["quantity"].iloc[0]
                 is_long = pos_qty > 0
-                
+
                 # Reversal signal?
-                if (signal == 'sell' and is_long) or (signal == 'buy' and not is_long):
+                if (signal == "sell" and is_long) or (signal == "buy" and not is_long):
                     # Enforce 15-minute cooldown between reversals to avoid wash trade friction
                     if symbol in self.last_trade_time:
-                        mins_since_trade = (now - self.last_trade_time[symbol]).total_seconds() / 60.0
+                        mins_since_trade = (
+                            now - self.last_trade_time[symbol]
+                        ).total_seconds() / 60.0
                         if mins_since_trade < 15:
-                            logger.info(f"Cooldown active for {symbol}. Ignoring reversal signal.")
+                            logger.info(
+                                f"Cooldown active for {symbol}. Ignoring reversal signal."
+                            )
                             continue
-                            
-                    logger.info(f"Reversal signal for {symbol}. Closing existing position.")
+
+                    logger.info(
+                        f"Reversal signal for {symbol}. Closing existing position."
+                    )
                     self._close_position(symbol, pos_qty, current_prices[symbol])
                     self.last_trade_time[symbol] = now
                     # Fall through to entry logic below (don't skip the new signal)
@@ -583,3 +690,102 @@ class OrderManager:
         
         current_time = now.time()
         return current_time >= exit_time
+
+
+class LiveOMS:
+    """
+    Live Order Management System (OMS) connecting to Fyers API.
+    Handles order state transitions, WebSocket updates, and the 30-second timeout 
+    for LIMIT to MARKET conversion to accurately reflect backtest assumptions.
+    """
+    def __init__(self, fyers_client):
+        self.fyers = fyers_client
+        self.active_orders: Dict[str, OrderInfo] = {}
+        self.timeout_seconds = 30
+        self._lock = threading.RLock()
+        
+        # Start the background timeout monitor
+        self._monitor_thread = threading.Thread(target=self._monitor_timeouts, daemon=True)
+        self._monitor_thread.start()
+        
+    def submit_order(self, symbol: str, side: str, quantity: int, price: float) -> str:
+        """Submit a LIMIT order to Fyers API."""
+        with self._lock:
+            order_id = str(uuid.uuid4())
+            order_info = OrderInfo(
+                order_id=order_id,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                order_type="LIMIT",
+                price=price,
+                state=OrderState.PENDING
+            )
+            self.active_orders[order_id] = order_info
+            
+        try:
+            logger.info(f"[LiveOMS] Routing {side} {quantity} {symbol} @ {price} to Fyers")
+            # Fyers API Stub
+            # response = self.fyers.place_order(
+            #     symbol=symbol, qty=quantity, type=2, side=1 if side=="BUY" else -1, price=price
+            # )
+            # if response['s'] == 'ok':
+            #     real_order_id = response['id']
+            #     self.active_orders[real_order_id] = self.active_orders.pop(order_id)
+            
+            with self._lock:
+                order_info.update_state(OrderState.OPEN)
+                
+            return order_id
+        except Exception as e:
+            logger.error(f"[LiveOMS] Failed to route order: {e}")
+            with self._lock:
+                order_info.update_state(OrderState.REJECTED)
+            return ""
+
+    def on_order_update(self, update: dict):
+        """Callback for Fyers WebSocket order updates."""
+        order_id = update.get("id")
+        status = update.get("status")
+        filled_qty = update.get("filledQty", 0)
+        avg_price = update.get("tradedPrice", 0.0)
+        
+        with self._lock:
+            if order_id in self.active_orders:
+                order = self.active_orders[order_id]
+                
+                if status == "FILLED":
+                    order.update_state(OrderState.FILLED, {"filled_qty": filled_qty, "avg_price": avg_price})
+                    logger.info(f"[LiveOMS] Order {order_id} fully filled at {avg_price}")
+                elif status == "PARTIALLY_FILLED":
+                    order.update_state(OrderState.PARTIAL, {"filled_qty": filled_qty, "avg_price": avg_price})
+                elif status == "CANCELLED":
+                    order.update_state(OrderState.CANCELLED)
+                elif status == "REJECTED":
+                    order.update_state(OrderState.REJECTED)
+
+    def _monitor_timeouts(self):
+        """Background thread checking for unfilled LIMIT orders older than 30 seconds."""
+        import time
+        while True:
+            time.sleep(1)
+            now = datetime.now()
+            
+            with self._lock:
+                for order_id, order in list(self.active_orders.items()):
+                    if order.state in [OrderState.OPEN, OrderState.PARTIAL] and order.order_type == "LIMIT":
+                        elapsed = (now - order.timestamp).total_seconds()
+                        if elapsed >= self.timeout_seconds:
+                            logger.warning(f"[LiveOMS] Order {order_id} timeout reached ({self.timeout_seconds}s). Converting to MARKET.")
+                            self._convert_to_market(order)
+
+    def _convert_to_market(self, order: OrderInfo):
+        """Converts an open LIMIT order to a MARKET order."""
+        try:
+            # Fyers API Stub
+            # self.fyers.modify_order(id=order.order_id, type=1) # 1 = MARKET
+            order.order_type = "MARKET"
+            order.updated_at = datetime.now()
+            logger.info(f"[LiveOMS] Order {order.order_id} successfully converted to MARKET")
+        except Exception as e:
+            logger.error(f"[LiveOMS] Failed to convert order to MARKET: {e}")

@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/672684679970642744/d5e6d438996f4028b1281bba246cc0db/artifacts
+end_time: 1786638746276
+entry_point_name: ''
+experiment_id: '672684679970642744'
+lifecycle_stage: active
+run_id: d5e6d438996f4028b1281bba246cc0db
+run_name: adventurous-boar-491
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1786638744006
+status: 3
+tags: []
+user_id: khand

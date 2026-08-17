@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/672684679970642744/6b33e80264924433bd081946277b0a33/artifacts
+end_time: 1786638710003
+entry_point_name: ''
+experiment_id: '672684679970642744'
+lifecycle_stage: active
+run_id: 6b33e80264924433bd081946277b0a33
+run_name: classy-crab-836
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1786638707920
+status: 3
+tags: []
+user_id: khand

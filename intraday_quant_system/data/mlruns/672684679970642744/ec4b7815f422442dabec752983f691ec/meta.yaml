@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/672684679970642744/ec4b7815f422442dabec752983f691ec/artifacts
+end_time: 1786638004691
+entry_point_name: ''
+experiment_id: '672684679970642744'
+lifecycle_stage: active
+run_id: ec4b7815f422442dabec752983f691ec
+run_name: stately-bat-109
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1786637999409
+status: 3
+tags: []
+user_id: khand

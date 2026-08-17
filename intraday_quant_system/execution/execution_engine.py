@@ -1,22 +1,26 @@
 import logging
 import math
-import time
-import pandas as pd
-from typing import Dict, Any, List
-import uuid
-from datetime import datetime, timedelta
 import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
-from execution.algorithms import TWAP, VWAP
+from datetime import datetime, timedelta
+from typing import Any
+
+import pandas as pd
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+
+from .algorithms import TWAP, VWAP
 
 logger = logging.getLogger(__name__)
+
 
 class APICircuitBreaker:
     """
     Lightweight circuit breaker for broker API calls.
     If 3 failures occur within 30 seconds, the circuit opens for 60 seconds.
     """
+
     def __init__(self, max_failures: int = 3, window: float = 30.0):
         self.max_failures = max_failures
         self.backoff_levels = [60.0, 300.0, 900.0]  # 1 min, 5 min, 15 min
@@ -30,9 +34,13 @@ class APICircuitBreaker:
         """Returns True if call is allowed, False otherwise"""
         now = time.time()
         if self.state == "OPEN":
-            current_timeout = self.backoff_levels[min(self.current_backoff_idx, len(self.backoff_levels) - 1)]
+            current_timeout = self.backoff_levels[
+                min(self.current_backoff_idx, len(self.backoff_levels) - 1)
+            ]
             if now - self.last_state_change > current_timeout:
-                logger.warning(f"Circuit breaker transitioning to HALF-OPEN after {current_timeout}s timeout")
+                logger.warning(
+                    f"Circuit breaker transitioning to HALF-OPEN after {current_timeout}s timeout"
+                )
                 self.state = "HALF-OPEN"
                 self.last_state_change = now
                 return True
@@ -44,37 +52,51 @@ class APICircuitBreaker:
         if self.state != "CLOSED":
             logger.info("Circuit breaker successfully reset to CLOSED")
             self.state = "CLOSED"
-            self.current_backoff_idx = max(0, self.current_backoff_idx - 1) # Reduce backoff level slowly
+            self.current_backoff_idx = max(
+                0, self.current_backoff_idx - 1
+            )  # Reduce backoff level slowly
             self.last_state_change = time.time()
 
     def record_failure(self):
         now = time.time()
         self.failure_timestamps.append(now)
         # Filter failures outside the window
-        self.failure_timestamps = [t for t in self.failure_timestamps if now - t <= self.window]
-        
+        self.failure_timestamps = [
+            t for t in self.failure_timestamps if now - t <= self.window
+        ]
+
         if len(self.failure_timestamps) >= self.max_failures:
             if self.state != "OPEN":
-                timeout = self.backoff_levels[min(self.current_backoff_idx, len(self.backoff_levels) - 1)]
-                logger.critical(f"APICircuitBreaker: {len(self.failure_timestamps)} failures in {self.window}s. OPENING CIRCUIT for {timeout}s!")
+                timeout = self.backoff_levels[
+                    min(self.current_backoff_idx, len(self.backoff_levels) - 1)
+                ]
+                logger.critical(
+                    f"APICircuitBreaker: {len(self.failure_timestamps)} failures in {self.window}s. OPENING CIRCUIT for {timeout}s!"
+                )
                 self.state = "OPEN"
                 self.current_backoff_idx += 1  # Escalation!
                 self.last_state_change = now
 
+
 class ExecutionEngine:
     """
     Execution Engine interacting with the broker API.
-    
+
     Production features:
       - Explicit paper_trading mode
       - Robust slippage model
       - Position state tracking
     """
+
     @staticmethod
     def _is_retryable_error(exception) -> bool:
         """Check if exception is a 429 Too Many Requests or generic timeout"""
         error_str = str(exception).lower()
-        if "429" in error_str or "too many requests" in error_str or "timeout" in error_str:
+        if (
+            "429" in error_str
+            or "too many requests" in error_str
+            or "timeout" in error_str
+        ):
             return True
         return False
 
@@ -85,30 +107,33 @@ class ExecutionEngine:
         reraise=True,
         before_sleep=lambda retry_state: logger.warning(
             f"Broker API rate limit/timeout hit. Retrying in {retry_state.next_action.sleep}s... Attempt {retry_state.attempt_number}"
-        )
+        ),
     )
     def _execute_with_retry(self, func, *args, **kwargs):
         """Execute a broker API call with exponential backoff retry"""
         return func(*args, **kwargs)
-    def __init__(self, api_key: str = "", api_secret: str = "", paper_trading: bool = True):
+
+    def __init__(
+        self, api_key: str = "", api_secret: str = "", paper_trading: bool = True
+    ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.kite = None  # In prod: KiteConnect(api_key=self.api_key)
         self.paper_trading = paper_trading
-        
+
         # State tracking for paper trading
-        self._mock_positions: Dict[str, Dict] = {}
-        self._mock_orders: Dict[str, Dict] = {} # Keyed by order_id
+        self._mock_positions: dict[str, dict] = {}
+        self._mock_orders: dict[str, dict] = {}  # Keyed by order_id
         self._mock_balance = 1000000.0
-        self._active_algorithms: Dict[str, Any] = {}
+        self._active_algorithms: dict[str, Any] = {}
         self._lock = threading.RLock()
-        
+
         # Thread pool for ultra-low latency async API calls (avoiding GIL blocking on network I/O)
         self.executor = ThreadPoolExecutor(max_workers=10)
-        
+
         # Circuit breaker
         self.circuit_breaker = APICircuitBreaker()
-        
+
         if self.paper_trading:
             logger.info("ExecutionEngine initialized in PAPER TRADING mode")
         else:
@@ -118,7 +143,7 @@ class ExecutionEngine:
         if self.paper_trading:
             logger.info("Mock authentication successful")
             return
-            
+
         if self.kite:
             try:
                 # data = self.kite.generate_session(request_token, api_secret=self.api_secret)
@@ -128,7 +153,16 @@ class ExecutionEngine:
                 logger.error(f"Broker authentication failed: {e}")
                 raise
 
-    def place_order(self, symbol: str, quantity: int, side: str, order_type: str = "MARKET", price: float = 0.0, market_depth: dict = None, prev_close: float = None) -> str:
+    def place_order(
+        self,
+        symbol: str,
+        quantity: int,
+        side: str,
+        order_type: str = "MARKET",
+        price: float = 0.0,
+        market_depth: dict = None,
+        prev_close: float = None,
+    ) -> str:
         """
         Place an order to the broker.
         side: "BUY" or "SELL"
@@ -136,70 +170,90 @@ class ExecutionEngine:
         market_depth: Optional depth info to check circuit limits
         """
         if not self.circuit_breaker.check_call():
-            logger.critical("API call blocked by Circuit Breaker (State: OPEN). Switching to monitoring-only.")
+            logger.critical(
+                "API call blocked by Circuit Breaker (State: OPEN). Switching to monitoring-only."
+            )
             return ""
 
         if quantity <= 0:
             logger.error(f"Invalid quantity {quantity} for {symbol}")
             return ""
-            
+
         # Circuit Limit Pre-Trade Check
         if market_depth is not None:
             if side == "BUY" and market_depth.get("ask_volume", 1) == 0:
-                logger.critical(f"Upper Circuit Hit for {symbol}. Order rejected to protect margin.")
+                logger.critical(
+                    f"Upper Circuit Hit for {symbol}. Order rejected to protect margin."
+                )
                 return ""
             if side == "SELL" and market_depth.get("bid_volume", 1) == 0:
-                logger.critical(f"Lower Circuit Hit for {symbol}. Order rejected to protect margin.")
+                logger.critical(
+                    f"Lower Circuit Hit for {symbol}. Order rejected to protect margin."
+                )
                 return ""
-                
+
         # Redundant Velocity Circuit Limit Check (protects against stale L1 depth)
         if prev_close is not None and price > 0:
             price_change_pct = abs(price - prev_close) / prev_close
-            if price_change_pct > 0.095:  # 9.5% indicates we are near a standard 10% circuit limit
-                logger.critical(f"Velocity Circuit Limit Pre-Emptive Halt for {symbol}. Price changed {price_change_pct:.2%}. Order blocked.")
+            if (
+                price_change_pct > 0.095
+            ):  # 9.5% indicates we are near a standard 10% circuit limit
+                logger.critical(
+                    f"Velocity Circuit Limit Pre-Emptive Halt for {symbol}. Price changed {price_change_pct:.2%}. Order blocked."
+                )
                 return ""
-                
+
         # Handle institutional large orders via simulated TWAP to minimize market impactfor size. Replace with TWAP.
-        if order_type == "MARKET" and quantity > 500: # Arbitrary large lot threshold
-            logger.warning("Large MARKET order detected. Institutional override applying TWAP routing.")
+        if order_type == "MARKET" and quantity > 500:  # Arbitrary large lot threshold
+            logger.warning(
+                "Large MARKET order detected. Institutional override applying TWAP routing."
+            )
             order_type = "TWAP"
 
         if order_type in ["TWAP", "VWAP"]:
             algo_id = str(uuid.uuid4())
             start_time = datetime.now()
-            end_time = start_time + timedelta(minutes=30) # Default 30 min window
-            
+            end_time = start_time + timedelta(minutes=30)  # Default 30 min window
+
             if order_type == "TWAP":
                 algo = TWAP(symbol, quantity, side, start_time, end_time)
             else:
                 algo = VWAP(symbol, quantity, side, start_time, end_time)
-                
+
             self._active_algorithms[algo_id] = algo
-            logger.info(f"Initialized {order_type} algorithm {algo_id} for {quantity} {symbol}")
+            logger.info(
+                f"Initialized {order_type} algorithm {algo_id} for {quantity} {symbol}"
+            )
             return algo_id
 
-        logger.info(f"Placing {order_type} {side} order for {quantity} {symbol} @ {price}")
-        
+        logger.info(
+            f"Placing {order_type} {side} order for {quantity} {symbol} @ {price}"
+        )
+
         if self.paper_trading:
             # Paper trading always succeeds
             self.circuit_breaker.record_success()
             return self._place_mock_order(symbol, quantity, side, order_type, price)
-            
+
         # Live trading logic via concurrent non-blocking executor
-        future = self.executor.submit(self._execute_live_order, symbol, quantity, side, order_type, price)
+        future = self.executor.submit(
+            self._execute_live_order, symbol, quantity, side, order_type, price
+        )
         # In a fully async system, we would await the future or register a callback.
         # Here we return a pending UUID and resolve it asynchronously via callbacks in order_manager
         return "pending_" + str(uuid.uuid4())
 
-    def _execute_live_order(self, symbol: str, quantity: int, side: str, order_type: str, price: float):
+    def _execute_live_order(
+        self, symbol: str, quantity: int, side: str, order_type: str, price: float
+    ):
         try:
             # Exchange-Native OCO & Trailing Stop logic goes here
             # e.g., if we pass a stop_loss and take_profit params in place_order,
             # this method would dispatch a single POST to Binance's /api/v3/order/oco
             # achieving 0ms local compute latency.
-            
+
             # Simulated delay for REST
-            time.sleep(0.015) 
+            time.sleep(0.015)
             self.circuit_breaker.record_success()
             logger.info(f"Successfully placed live order for {symbol}")
             return True
@@ -207,110 +261,169 @@ class ExecutionEngine:
             logger.error(f"Live order placement failed: {e}")
             self.circuit_breaker.record_failure()
             return False
-            
-    def _place_mock_order(self, symbol: str, quantity: int, side: str, order_type: str, price: float) -> str:
+
+    def _place_mock_order(
+        self, symbol: str, quantity: int, side: str, order_type: str, price: float
+    ) -> str:
         with self._lock:
             order_id = str(uuid.uuid4())
-            
+
             order = {
-                'order_id': order_id,
-                'symbol': symbol,
-                'quantity': quantity,
-                'side': side,
-                'type': order_type,
-                'price': price,
-                'status': 'OPEN' if order_type == 'LIMIT' else 'COMPLETE',
-                'average_price': 0.0,
-                'timestamp': datetime.now()
+                "order_id": order_id,
+                "symbol": symbol,
+                "quantity": quantity,
+                "side": side,
+                "type": order_type,
+                "price": price,
+                "status": "OPEN" if order_type == "LIMIT" else "COMPLETE",
+                "average_price": 0.0,
+                "timestamp": datetime.now(),
             }
-            
+
             if order_type in ["MARKET", "TWAP"]:
                 # Simulate execution price (add slippage)
                 exec_price = price
                 if price > 0:
                     # TWAP reduces slippage by a factor
                     reduction_factor = 0.3 if order_type == "TWAP" else 1.0
-                    slippage = self.estimate_slippage(quantity * price, 100000000, side=side) * reduction_factor
-                    exec_price = price + (price * slippage) if side == "BUY" else price - (price * slippage)
-                order['average_price'] = exec_price
-                order['status'] = 'COMPLETE' # Fast forward TWAP completion in paper mode
+                    slippage = (
+                        self.estimate_slippage(quantity * price, 100000000, side=side)
+                        * reduction_factor
+                    )
+                    exec_price = (
+                        price + (price * slippage)
+                        if side == "BUY"
+                        else price - (price * slippage)
+                    )
+                order["average_price"] = exec_price
+                order["status"] = (
+                    "COMPLETE"  # Fast forward TWAP completion in paper mode
+                )
                 self._update_position(symbol, quantity, side, exec_price)
-                logger.info(f"Mock {order_type} order executed: {side} {quantity} {symbol} @ {exec_price:.2f}")
+                logger.info(
+                    f"Mock {order_type} order executed: {side} {quantity} {symbol} @ {exec_price:.2f}"
+                )
             else:
-                logger.info(f"Mock LIMIT order placed: {side} {quantity} {symbol} @ {price:.2f}")
-                
+                logger.info(
+                    f"Mock LIMIT order placed: {side} {quantity} {symbol} @ {price:.2f}"
+                )
+
             self._mock_orders[order_id] = order
             return order_id
 
-    def _update_position(self, symbol: str, quantity: int, side: str, exec_price: float):
+    def _update_position(
+        self, symbol: str, quantity: int, side: str, exec_price: float
+    ):
         with self._lock:
-            current_pos = self._mock_positions.get(symbol, {'quantity': 0, 'average_price': 0.0})
-            curr_qty = current_pos['quantity']
-            curr_avg = current_pos['average_price']
-            
+            current_pos = self._mock_positions.get(
+                symbol, {"quantity": 0, "average_price": 0.0}
+            )
+            curr_qty = current_pos["quantity"]
+            curr_avg = current_pos["average_price"]
+
             if side == "BUY":
                 new_qty = curr_qty + quantity
             else:
                 new_qty = curr_qty - quantity
-            
+
             # Check for flat position FIRST to prevent division by zero
             if new_qty == 0:
                 if symbol in self._mock_positions:
                     del self._mock_positions[symbol]
                 return
-            
+
             # Compute new average price
             if side == "BUY":
                 if curr_qty >= 0:
-                    new_avg = ((curr_qty * curr_avg) + (quantity * exec_price)) / new_qty
+                    new_avg = (
+                        (curr_qty * curr_avg) + (quantity * exec_price)
+                    ) / new_qty
                 else:
                     new_avg = curr_avg if new_qty < 0 else exec_price
             else:
                 if curr_qty <= 0:
-                    new_avg = ((abs(curr_qty) * curr_avg) + (quantity * exec_price)) / abs(new_qty)
+                    new_avg = (
+                        (abs(curr_qty) * curr_avg) + (quantity * exec_price)
+                    ) / abs(new_qty)
                 else:
                     new_avg = curr_avg if new_qty > 0 else exec_price
-            
-            self._mock_positions[symbol] = {'quantity': new_qty, 'average_price': new_avg}
+
+            self._mock_positions[symbol] = {
+                "quantity": new_qty,
+                "average_price": new_avg,
+            }
 
     def convert_to_market(self, order_id: str, current_price: float):
         """Force execution of an open LIMIT order by converting to MARKET"""
         with self._lock:
             if order_id not in self._mock_orders:
                 return
-                
-            order = self._mock_orders[order_id]
-            if order['status'] != 'OPEN':
-                return
-                
-            logger.info(f"Converting LIMIT order {order_id} to MARKET at {current_price}")
-            order['type'] = 'MARKET'
-            order['status'] = 'COMPLETE'
-            
-            slippage = self.estimate_slippage(order['quantity'] * current_price, 100000000, side=order['side'])
-            exec_price = current_price + (current_price * slippage) if order['side'] == "BUY" else current_price - (current_price * slippage)
-            order['average_price'] = exec_price
-            
-            self._update_position(order['symbol'], order['quantity'], order['side'], exec_price)
 
+            order = self._mock_orders[order_id]
+            if order["status"] != "OPEN":
+                return
+
+            logger.info(
+                f"Converting LIMIT order {order_id} to MARKET at {current_price}"
+            )
+            order["type"] = "MARKET"
+            order["status"] = "COMPLETE"
+
+            slippage = self.estimate_slippage(
+                order["quantity"] * current_price, 100000000, side=order["side"]
+            )
+            exec_price = (
+                current_price + (current_price * slippage)
+                if order["side"] == "BUY"
+                else current_price - (current_price * slippage)
+            )
+            order["average_price"] = exec_price
+
+            self._update_position(
+                order["symbol"], order["quantity"], order["side"], exec_price
+            )
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a specific order by order_id"""
+        with self._lock:
+            if order_id not in self._mock_orders:
+                logger.warning(f"Order {order_id} not found for cancellation")
+                return False
+
+            order = self._mock_orders[order_id]
+            if order["status"] != "OPEN":
+                logger.warning(f"Order {order_id} is not open (status: {order['status']}), cannot cancel")
+                return False
+
+            order["status"] = "CANCELLED"
+            logger.info(f"Cancelled order {order_id} for {order['symbol']}")
+            return True
 
     def process_algorithms(self, current_time: datetime = None, market_data=None):
         """Tick all active algorithms and execute their slices"""
         if current_time is None:
             current_time = datetime.now()
-            
+
         completed = []
         for algo_id, algo in self._active_algorithms.items():
             slice_qty = algo.get_next_slice(current_time, market_data)
             if slice_qty > 0:
-                logger.info(f"Algorithm {algo_id} executing slice: {slice_qty} {algo.symbol}")
+                logger.info(
+                    f"Algorithm {algo_id} executing slice: {slice_qty} {algo.symbol}"
+                )
                 # Execute the slice as MARKET
-                self.place_order(algo.symbol, slice_qty, algo.side, order_type="MARKET_SLICE", price=0.0)
-            
+                self.place_order(
+                    algo.symbol,
+                    slice_qty,
+                    algo.side,
+                    order_type="MARKET_SLICE",
+                    price=0.0,
+                )
+
             if not algo.is_active:
                 logger.info(f"Algorithm {algo_id} completed.")
                 completed.append(algo_id)
-                
+
         for cid in completed:
             del self._active_algorithms[cid]
 
@@ -319,16 +432,18 @@ class ExecutionEngine:
         if self.paper_trading:
             if not self._mock_positions:
                 return pd.DataFrame()
-            
+
             data = []
             for sym, pos in self._mock_positions.items():
-                data.append({
-                    'symbol': sym,
-                    'quantity': pos['quantity'],
-                    'average_price': pos['average_price']
-                })
+                data.append(
+                    {
+                        "symbol": sym,
+                        "quantity": pos["quantity"],
+                        "average_price": pos["average_price"],
+                    }
+                )
             return pd.DataFrame(data)
-            
+
         try:
             # positions = self.kite.positions()
             # net_positions = positions.get("net", [])
@@ -339,21 +454,23 @@ class ExecutionEngine:
             logger.error(f"Failed to fetch positions: {e}")
             return pd.DataFrame()
 
-    def estimate_slippage(self, order_size: float, adv: float, side: str = "BUY") -> float:
+    def estimate_slippage(
+        self, order_size: float, adv: float, side: str = "BUY"
+    ) -> float:
         """
         Estimate slippage using an asymmetric Almgren-Chriss style square-root impact model.
         Buying (demanding liquidity in thin books) is modeled as more expensive than selling.
         """
         if adv <= 0:
-            return 0.005 # Default 50bps for unknown volume
-            
+            return 0.005  # Default 50bps for unknown volume
+
         participation_rate = order_size / adv
         # k is an empirical constant for Indian equities
-        k = 0.1 
-        
+        k = 0.1
+
         # Asymmetric impact: buying is 1.5x more expensive than selling in typical markets
         asymmetry_multiplier = 1.5 if side.upper() == "BUY" else 0.8
-        
+
         impact = k * math.sqrt(participation_rate) * asymmetry_multiplier
         # Cap at 1% to prevent absurd estimates
         return min(impact, 0.01)
@@ -365,14 +482,14 @@ class ExecutionEngine:
             # Paper mode: mark all matching open orders as CANCELLED
             cancelled_count = 0
             for order_id, order in list(self._mock_orders.items()):
-                if order['status'] == 'OPEN':
-                    if symbol is None or order['symbol'] == symbol:
-                        order['status'] = 'CANCELLED'
+                if order["status"] == "OPEN":
+                    if symbol is None or order["symbol"] == symbol:
+                        order["status"] = "CANCELLED"
                         cancelled_count += 1
             if cancelled_count > 0:
                 logger.info(f"Cancelled {cancelled_count} paper orders")
             return
-            
+
         # Live implementation
         # try:
         #     orders = self.kite.orders()

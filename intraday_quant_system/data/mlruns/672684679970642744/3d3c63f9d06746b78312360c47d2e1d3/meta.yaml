@@ -1,0 +1,14 @@
+artifact_uri: file:C:/Users/khand/Desktop/tool/intraday/intraday_quant_system/data/mlruns/672684679970642744/3d3c63f9d06746b78312360c47d2e1d3/artifacts
+end_time: 1786638238566
+entry_point_name: ''
+experiment_id: '672684679970642744'
+lifecycle_stage: active
+run_id: 3d3c63f9d06746b78312360c47d2e1d3
+run_name: thundering-bee-358
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1786638236650
+status: 3
+tags: []
+user_id: khand

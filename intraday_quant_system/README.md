@@ -70,6 +70,18 @@ An institutional-grade intraday trading system for India's National Stock Exchan
 
 ---
 
+## Rigorous Validation & Anti-Leakage (Walk-Forward CV)
+
+To guard against false conclusions and overfitting before committing real capital, the system implements stringent statistical tests and cross-validation based on Marcos López de Prado's *Advances in Financial Machine Learning*:
+
+- **Purged Walk-Forward Cross-Validation**: Unlike standard K-Fold (which suffers from data leakage in time-series) or basic time-series splits, our `PurgedWalkForwardValidator` strictly enforces chronological training paths.
+- **Data Purging**: Removes target horizons at the end of every training set to eliminate forward-looking leakage.
+- **Embargoing**: Skips a set number of bars at the beginning of every validation set to prevent backward leakage from serial correlation.
+- **Triple-Barrier Labeling**: Realistic target classification (Stop-Loss, Take-Profit, Time-Expiry) parameterized by dynamic, rolling ATR volatility.
+- **Statistical Significance**: Validates that out-of-sample (OOS) AUC significantly exceeds random chance, discounting non-stationary edge decay.
+
+---
+
 ## Tech Stack
 
 | Category | Tools |
